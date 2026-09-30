@@ -1,0 +1,52 @@
+services:
+  ai-server:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      OLLAMA_MODEL: qwen2.5-coder:1.5b
+      RAG_ENABLED: "false"
+      RAG_TOP_K: "3"
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: cobip_knowledge
+      EMBEDDING_MODEL: BAAI/bge-m3
+    depends_on:
+      - ollama
+      - qdrant
+      - redis
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  ollama:
+  qdrant_storage:

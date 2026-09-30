@@ -1,0 +1,25 @@
+# EC2 운영 RAG + Redis cache 확장 (docker-compose.deploy.yml 과 함께 사용)
+#
+# 기본 운영 실행 (임시 override 파일 불필요):
+#   docker compose -f docker-compose.deploy.yml -f docker-compose.rag.yml \
+#     up -d --no-build --pull never --no-deps ai-server
+#
+# compose environment 가 app 기본값·.env 보다 우선한다.
+# Redis 서비스는 deploy.yml 의 redis(호스트명 redis) 를 사용한다.
+
+services:
+  ai-server:
+    environment:
+      RAG_ENABLED: "true"
+      EMBEDDING_WARMUP_ENABLED: "true"
+      EMBEDDING_WARMUP_TEXT: "Spring Boot 로그인 기능템플릿 RAG warm up"
+      REDIS_URL: redis://redis:6379/0
+      RAG_RETRIEVAL_CACHE_ENABLED: "true"
+      RAG_RETRIEVAL_CACHE_TTL_SECONDS: "3600"
+      FEATURE_TEMPLATE_CACHE_ENABLED: "true"
+      FEATURE_TEMPLATE_CACHE_TTL_SECONDS: "3600"
+      FEATURE_TEMPLATE_FAST_SKELETON_ENABLED: "true"
+      FEATURE_TEMPLATE_ULTRA_FAST_SKELETON_ENABLED: "true"
+      FEATURE_TEMPLATE_SKELETON_RAG_TOP_K: "2"
+      FEATURE_TEMPLATE_SKELETON_RAG_CONTENT_MAX_CHARS: "300"
+      FEATURE_TEMPLATE_SKELETON_MAX_TOKENS: "800"
