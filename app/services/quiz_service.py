@@ -13,14 +13,92 @@ from app.schemas.quiz import (
     QuizGenerateRequest,
     QuizGenerateResponseData,
     QuizQuestionItem,
+    normalize_quiz_type,
 )
 from app.schemas.rag import RetrievedReference
+from app.services.focused_retriever import FocusedRetriever, extract_focus_terms
 from app.services.llm_service import LLMService
 from app.services.retriever_service import RetrieverService
 
 __all__ = ["QuizService"]
 
 logger = logging.getLogger(__name__)
+
+_FOCUSED_TOP_K = 6
+
+_TYPE_PROMPT_RULES: dict[str, str] = {
+    "multiple_choice": (
+        "\n[주의: multiple_choice(4지선다) 문제]\n"
+        "- options는 '1. ...' ~ '4. ...' 형식의 보기 4개 배열, answer는 정답 보기 번호('1'~'4')로 지정하라.\n"
+    ),
+    "ox": (
+        "\n[주의: OX 퀴즈인 경우]\n"
+        "- options 필드는 반드시 ['1. O', '2. X'] 형식이어야 하며, answer는 '1' 또는 '2' (또는 'O', 'X')로 지정하라.\n"
+    ),
+    "short_answer": (
+        "\n[주의: 단답형 퀴즈인 경우]\n"
+        "- options 필드는 null 또는 빈 리스트([])로 지정하고, answer는 실무 핵심 기술 키워드(예: 'MVCC', '인덱스')를 지정하라.\n"
+    ),
+    "blank": (
+        "\n[주의: blank(빈칸 채우기) 문제]\n"
+        "- question에 실무 명령어/설정/개념 문장을 제시하고 핵심 키워드 자리를 '___'로 표시하라(1~2개).\n"
+        "- options는 null, answer는 빈칸 정답 문자열(빈칸이 여러 개면 순서대로 ', '로 구분)로 지정하라.\n"
+    ),
+    "descriptive": (
+        "\n[주의: descriptive(서술형) 문제]\n"
+        "- question에 실무 트러블슈팅/설계 상황을 제시하고 원인·확인 순서·해결 방법을 설명하도록 요구하라.\n"
+        "- options는 null, answer는 3~5문장의 모범 답안, gradingKeywords는 채점 핵심 키워드 3~5개 배열로 지정하라.\n"
+    ),
+}
+
+_BLANK_MARKER = re.compile(r"_{3,}|□{2,}|\(\s*\)")
+_CHUNK_HEADER = re.compile(r"^\[[^\]\n]*\]\s*\n?")
+_CODE_FENCE = re.compile(r"```.*?(```|$)", re.DOTALL)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+_LIST_PREFIX = re.compile(r"^(?:[-*>]\s+|\d+[.)]\s+)")
+_INLINE_TERM = re.compile(r"`([^`\n]{2,40})`|\*\*([^*\n]{2,40})\*\*")
+
+
+def _missing_counts(buckets: dict[str, list[QuizQuestionItem]], plan: list[tuple[str, int]]) -> dict[str, int]:
+    return {t: n - len(buckets[t]) for t, n in plan if len(buckets[t]) < n}
+
+
+def _infer_quiz_type(item: dict[str, Any], question: str, plan_types: list[str]) -> str | None:
+    """type 필드가 없거나 알 수 없을 때 문항 구조로 유형을 추정한다."""
+    if len(plan_types) == 1:
+        return plan_types[0]
+    options = item.get("options")
+    if isinstance(options, list) and len(options) >= 3 and "multiple_choice" in plan_types:
+        return "multiple_choice"
+    if _BLANK_MARKER.search(question) and "blank" in plan_types:
+        return "blank"
+    if not options and "descriptive" in plan_types:
+        return "descriptive"
+    return None
+
+
+def _reference_source(ref: RetrievedReference) -> str:
+    src = (ref.metadata or {}).get("source_file")
+    return src if isinstance(src, str) and src else (ref.title or ref.id or "")
+
+
+def _reference_sentences(ref: RetrievedReference) -> list[str]:
+    body = _CODE_FENCE.sub(" ", _CHUNK_HEADER.sub("", ref.content.strip()))
+    sentences: list[str] = []
+    for raw in _SENTENCE_SPLIT.split(body):
+        line = _LIST_PREFIX.sub("", raw.strip())
+        if line.startswith(("#", "|")) or not 15 <= len(line) <= 220:
+            continue
+        sentences.append(line)
+    return sentences
+
+
+def _plain(text: str) -> str:
+    return text.replace("**", "").replace("`", "").strip()
+
+
+def _reference_label(ref: RetrievedReference) -> str:
+    return (ref.title or _reference_source(ref) or "참고 지식").strip()
 
 
 class QuizService:
@@ -35,38 +113,15 @@ class QuizService:
     # =========================================================================
     def generate_quizzes(self, request: QuizGenerateRequest) -> QuizGenerateResponseData:
         """Qdrant에서 실무 지식을 검색하여 Context에 주입 후 퀴즈를 생성한다."""
+        plan = request.type_plan()
         keyword_str = " ".join(request.keywords or [])
-        query = f"{request.category} {keyword_str} 실무 핵심 CS 이론 개념 면접".strip()
 
-        # 1) Qdrant 지식 청크 검색 (Top 3~5)
-        references: list[RetrievedReference] = []
-        try:
-            references = self.retriever.retrieve(query, top_k=5)
-            logger.info(
-                "Quiz retrieval success: category=%s, hits=%d",
-                request.category,
-                len(references),
-            )
-        except Exception as exc:
-            logger.warning("Quiz retrieval error (fallback to general context): %s", exc)
-
+        references = self._retrieve_quiz_references(request, keyword_str)
         context_text = self._build_context_text(references)
 
-        # 2) 프롬프트 구성
         system_prompt = self._build_quiz_generate_system_prompt(request)
-        user_prompt = (
-            f"[요청 사양]\n"
-            f"- 카테고리: {request.category}\n"
-            f"- 난이도: {request.difficulty}\n"
-            f"- 문제 유형: {request.type}\n"
-            f"- 생성할 문제 수: {request.count}개\n"
-            f"- 키워드: {keyword_str if keyword_str else '전반적 핵심 개념'}\n\n"
-            f"[참고 지식 (Context)]\n"
-            f"{context_text}\n\n"
-            f"위 [참고 지식]의 기술적 내용과 실무 트러블슈팅 포인트를 반영하여 {request.count}개의 실무형 퀴즈를 순수 JSON 포맷으로 생성하라."
-        )
+        user_prompt = self._build_quiz_generate_user_prompt(request, plan, keyword_str, context_text)
 
-        # 3) LLM 호출 및 재시도 방어 로직 (최대 2회 재시도)
         quizzes = self._call_llm_with_retry_for_quizzes(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -75,14 +130,46 @@ class QuizService:
             max_retries=2,
         )
 
+        quiz_types = [t for t, _ in plan]
         return QuizGenerateResponseData(
             category=request.category,
             difficulty=request.difficulty,
-            type=request.type,
+            type=quiz_types[0] if len(quiz_types) == 1 else "mixed",
+            domain=request.domain,
+            quizTypes=quiz_types,
             totalCount=len(quizzes),
             quizzes=quizzes,
             retrievedKnowledgeCount=len(references),
+            retrievedSources=[_reference_source(ref) for ref in references],
         )
+
+    def _retrieve_quiz_references(
+        self, request: QuizGenerateRequest, keyword_str: str
+    ) -> list[RetrievedReference]:
+        """domain이 있으면 초점어 기반 multi-query 검색, 없으면 기존 단일 질의 검색."""
+        focus_terms = extract_focus_terms(request.domain, request.keywords) if request.domain else []
+        references: list[RetrievedReference] = []
+        try:
+            if focus_terms:
+                base_query = " ".join(p for p in (request.category, request.domain, keyword_str) if p)
+                references = FocusedRetriever(self.retriever).retrieve(
+                    base_query,
+                    focus_terms,
+                    top_k=_FOCUSED_TOP_K,
+                    context_hint=request.category,
+                )
+            else:
+                query = f"{request.category} {keyword_str} 실무 핵심 CS 이론 개념 면접".strip()
+                references = self.retriever.retrieve(query, top_k=5)
+            logger.info(
+                "Quiz retrieval success: category=%s, focus_terms=%d, hits=%d",
+                request.category,
+                len(focus_terms),
+                len(references),
+            )
+        except Exception as exc:
+            logger.warning("Quiz retrieval error (fallback to general context): %s", exc)
+        return references
 
     # =========================================================================
     # 2. 오답 분석 및 심층 해설 (Quiz Explanation)
@@ -201,17 +288,53 @@ class QuizService:
             "  ]\n"
             "}\n"
         )
-        if request.type == "ox":
+        plan_types = [t for t, _ in request.type_plan()]
+        if len(plan_types) > 1:
             prompt += (
-                "\n[주의: OX 퀴즈인 경우]\n"
-                "- options 필드는 반드시 ['1. O', '2. X'] 형식이어야 하며, answer는 '1' 또는 '2' (또는 'O', 'X')로 지정하라.\n"
+                "\n[주의: 여러 유형 동시 요청]\n"
+                "- [요청 사양]의 유형별 개수를 정확히 지켜라. 한 유형으로 몰아서 생성하지 마라.\n"
+                f"- 각 문제의 type 필드는 반드시 다음 값 중 하나여야 한다: {', '.join(plan_types)}\n"
             )
-        elif request.type == "short_answer":
-            prompt += (
-                "\n[주의: 단답형 퀴즈인 경우]\n"
-                "- options 필드는 null 또는 빈 리스트([])로 지정하고, answer는 실무 핵심 기술 키워드(예: 'MVCC', '인덱스')를 지정하라.\n"
-            )
+            prompt += _TYPE_PROMPT_RULES["multiple_choice"] if "multiple_choice" in plan_types else ""
+        for q_type in plan_types:
+            if q_type != "multiple_choice":
+                prompt += _TYPE_PROMPT_RULES.get(q_type, "")
         return prompt
+
+    def _build_quiz_generate_user_prompt(
+        self,
+        request: QuizGenerateRequest,
+        plan: list[tuple[str, int]],
+        keyword_str: str,
+        context_text: str,
+    ) -> str:
+        if request.quiz_types is None and request.domain is None:
+            return (
+                f"[요청 사양]\n"
+                f"- 카테고리: {request.category}\n"
+                f"- 난이도: {request.difficulty}\n"
+                f"- 문제 유형: {request.type}\n"
+                f"- 생성할 문제 수: {request.count}개\n"
+                f"- 키워드: {keyword_str if keyword_str else '전반적 핵심 개념'}\n\n"
+                f"[참고 지식 (Context)]\n"
+                f"{context_text}\n\n"
+                f"위 [참고 지식]의 기술적 내용과 실무 트러블슈팅 포인트를 반영하여 {request.count}개의 실무형 퀴즈를 순수 JSON 포맷으로 생성하라."
+            )
+
+        total = sum(n for _, n in plan)
+        type_lines = "\n".join(f"  - {t}: {n}개" for t, n in plan)
+        return (
+            f"[요청 사양]\n"
+            f"- 카테고리: {request.category}\n"
+            f"- 세부 도메인: {request.domain or '카테고리 전반'}\n"
+            f"- 난이도: {request.difficulty}\n"
+            f"- 문제 유형별 생성 개수:\n{type_lines}\n"
+            f"- 총 문제 수: {total}개\n"
+            f"- 키워드: {keyword_str if keyword_str else '전반적 핵심 개념'}\n\n"
+            f"[참고 지식 (Context)]\n"
+            f"{context_text}\n\n"
+            f"위 [참고 지식] 중 세부 도메인과 관련된 내용을 중심으로, 유형별 개수를 정확히 지켜 총 {total}개의 실무형 퀴즈를 순수 JSON 포맷으로 생성하라."
+        )
 
     def _call_llm_with_retry_for_quizzes(
         self,
@@ -221,11 +344,47 @@ class QuizService:
         references: list[RetrievedReference],
         max_retries: int = 2,
     ) -> list[QuizQuestionItem]:
-        last_error = None
-        current_user_prompt = user_prompt
-
+        """LLM 결과를 유형별로 검증·배분하고, 부족한 유형은 보충 요청 → 대체 문항 순으로 채운다."""
+        plan = request.type_plan()
+        plan_types = [t for t, _ in plan]
         ref_titles = [ref.title for ref in references if ref.title]
+        buckets: dict[str, list[QuizQuestionItem]] = {t: [] for t in plan_types}
 
+        raw_items = self._request_quiz_items(system_prompt, user_prompt, max_retries)
+        self._distribute_items(raw_items, buckets, plan, request, ref_titles)
+
+        missing = _missing_counts(buckets, plan)
+        if raw_items and missing:
+            logger.warning("LLM quiz result missing types=%s. Requesting supplement.", missing)
+            supplement_prompt = (
+                f"{user_prompt}\n\n"
+                f"[추가 요청: 이전 응답에서 다음 유형이 부족했습니다. 아래 유형과 개수만 정확히 생성하라]\n"
+                + "\n".join(f"- {t}: {n}개" for t, n in missing.items())
+            )
+            self._distribute_items(
+                self._request_quiz_items(system_prompt, supplement_prompt, 0), buckets, plan, request, ref_titles
+            )
+            missing = _missing_counts(buckets, plan)
+
+        if missing:
+            logger.error("Filling missing quiz types with backup quizzes: %s", missing)
+            used = {q.question for items in buckets.values() for q in items}
+            for q_type, n in missing.items():
+                buckets[q_type].extend(
+                    self._backup_quizzes_for_type(request, q_type, n, references, ref_titles, used)
+                )
+
+        quizzes: list[QuizQuestionItem] = []
+        for q_type, n in plan:
+            for item in buckets[q_type][:n]:
+                quizzes.append(item.model_copy(update={"id": len(quizzes) + 1}))
+        logger.info("Quiz generation complete: plan=%s total=%d", plan, len(quizzes))
+        return quizzes
+
+    def _request_quiz_items(self, system_prompt: str, user_prompt: str, max_retries: int) -> list[dict[str, Any]]:
+        """LLM 호출 + JSON 추출. 모든 시도 실패 시 빈 리스트."""
+        last_error: Exception | None = None
+        current_user_prompt = user_prompt
         for attempt in range(max_retries + 1):
             try:
                 raw_text = self.llm.generate_text(
@@ -234,51 +393,14 @@ class QuizService:
                     timeout_seconds=45,
                 )
                 parsed_json = self._extract_json(raw_text)
-
-                # 'quizzes' 키 또는 루트 리스트 처리
                 items_data = parsed_json.get("quizzes", parsed_json) if isinstance(parsed_json, dict) else parsed_json
                 if not isinstance(items_data, list):
                     raise ValueError(f"JSON 결과에 퀴즈 리스트가 없습니다: {parsed_json.keys() if isinstance(parsed_json, dict) else type(parsed_json)}")
-
-                quizzes: list[QuizQuestionItem] = []
-                for idx, item in enumerate(items_data, 1):
-                    q_id = int(item.get("id", idx))
-                    q_text = str(item.get("question", "")).strip()
-                    if not q_text:
-                        continue
-                    q_type = str(item.get("type", request.type)).strip()
-                    options = item.get("options")
-                    if isinstance(options, list):
-                        options = [str(opt) for opt in options]
-                    elif q_type == "ox":
-                        options = ["1. O", "2. X"]
-                    else:
-                        options = None
-
-                    answer = str(item.get("answer", "1")).strip()
-                    explanation = str(item.get("explanation", "실무 관점 핵심 해설입니다.")).strip()
-                    q_refs = item.get("references")
-                    if not isinstance(q_refs, list) or not q_refs:
-                        q_refs = ref_titles[:2] if ref_titles else [request.category]
-
-                    quizzes.append(
-                        QuizQuestionItem(
-                            id=q_id,
-                            question=q_text,
-                            type=q_type,
-                            options=options,
-                            answer=answer,
-                            explanation=explanation,
-                            references=q_refs,
-                        )
-                    )
-
-                if quizzes:
-                    logger.info("Successfully generated %d quizzes (attempt %d)", len(quizzes), attempt + 1)
-                    return quizzes[: request.count]
-
-                raise ValueError("파싱된 퀴즈 항목이 비어 있습니다.")
-
+                items = [item for item in items_data if isinstance(item, dict)]
+                if not items:
+                    raise ValueError("파싱된 퀴즈 항목이 비어 있습니다.")
+                logger.info("LLM returned %d quiz items (attempt %d)", len(items), attempt + 1)
+                return items
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -291,9 +413,87 @@ class QuizService:
                     f"[주의: 이전 응답이 JSON 파싱 또는 스키마 검증 오류({exc})를 발생시켰습니다. "
                     f"반드시 마크다운 없이 순수 JSON 포맷 {{'quizzes': [...]}} 으로만 엄격히 다시 출력하세요.]"
                 )
+        logger.error("All %d attempts failed: %s", max_retries + 1, last_error)
+        return []
 
-        logger.error("All %d attempts failed. Falling back to structured backup quizzes: %s", max_retries + 1, last_error)
-        return self._generate_fallback_quizzes(request, ref_titles)
+    def _distribute_items(
+        self,
+        raw_items: list[dict[str, Any]],
+        buckets: dict[str, list[QuizQuestionItem]],
+        plan: list[tuple[str, int]],
+        request: QuizGenerateRequest,
+        ref_titles: list[str],
+    ) -> None:
+        quota = dict(plan)
+        plan_types = list(quota)
+        seen = {q.question for items in buckets.values() for q in items}
+        for raw in raw_items:
+            item = self._normalize_quiz_item(raw, plan_types, request, ref_titles)
+            if item is None or item.question in seen or len(buckets[item.type]) >= quota[item.type]:
+                continue
+            seen.add(item.question)
+            buckets[item.type].append(item)
+
+    def _normalize_quiz_item(
+        self,
+        item: dict[str, Any],
+        plan_types: list[str],
+        request: QuizGenerateRequest,
+        ref_titles: list[str],
+    ) -> QuizQuestionItem | None:
+        """LLM 문항 1개를 표준 유형으로 정규화. 요청되지 않은 유형이거나 필수 필드가 없으면 None."""
+        q_text = str(item.get("question", "")).strip()
+        if not q_text:
+            return None
+
+        raw_type = item.get("type", item.get("quiz_type"))
+        q_type = normalize_quiz_type(raw_type) if raw_type is not None else None
+        if q_type is None:
+            q_type = _infer_quiz_type(item, q_text, plan_types)
+        if q_type is None or q_type not in plan_types:
+            return None
+
+        raw_options = item.get("options")
+        options: list[str] | None = None
+        if q_type == "multiple_choice":
+            if not isinstance(raw_options, list) or len(raw_options) < 2:
+                return None
+            options = [str(opt) for opt in raw_options]
+        elif q_type == "ox":
+            options = [str(opt) for opt in raw_options] if isinstance(raw_options, list) and raw_options else ["1. O", "2. X"]
+
+        raw_answer = item.get("answer", item.get("model_answer"))
+        if isinstance(raw_answer, list):
+            answer = ", ".join(str(a).strip() for a in raw_answer if str(a).strip())
+        elif raw_answer is None:
+            answer = "" if q_type in ("blank", "descriptive", "short_answer") else "1"
+        else:
+            answer = str(raw_answer).strip()
+        if not answer:
+            return None
+        if q_type == "blank" and not _BLANK_MARKER.search(q_text):
+            return None
+
+        grading_keywords: list[str] | None = None
+        if q_type == "descriptive":
+            raw_kw = item.get("gradingKeywords", item.get("grading_keywords", item.get("keywords")))
+            if isinstance(raw_kw, list):
+                grading_keywords = [str(k).strip() for k in raw_kw if str(k).strip()] or None
+
+        q_refs = item.get("references")
+        if not isinstance(q_refs, list) or not q_refs:
+            q_refs = ref_titles[:2] if ref_titles else [request.category]
+
+        return QuizQuestionItem(
+            id=0,
+            question=q_text,
+            type=q_type,
+            options=options,
+            answer=answer,
+            explanation=str(item.get("explanation", "실무 관점 핵심 해설입니다.")).strip(),
+            references=[str(r) for r in q_refs],
+            gradingKeywords=grading_keywords,
+        )
 
     def _call_llm_with_retry_for_explanation(
         self,
@@ -488,6 +688,175 @@ class QuizService:
                 pass
 
         raise ValueError(f"응답에서 유효한 JSON을 추출할 수 없습니다. 텍스트 앞부분: {cleaned[:150]}")
+
+    def _backup_quizzes_for_type(
+        self,
+        request: QuizGenerateRequest,
+        q_type: str,
+        count: int,
+        references: list[RetrievedReference],
+        ref_titles: list[str],
+        used: set[str],
+    ) -> list[QuizQuestionItem]:
+        """LLM이 채우지 못한 유형의 대체 문항.
+
+        기존 type/count 요청은 카테고리 템플릿을 먼저 사용하고, 이후 검색된 참고 지식으로 문항을 구성하며,
+        그래도 부족하면 도메인 중립 템플릿으로 채운다.
+        """
+        candidates: list[QuizQuestionItem] = []
+        if request.quiz_types is None and request.domain is None:
+            candidates.extend(q for q in self._generate_fallback_quizzes(request, ref_titles) if q.type == q_type)
+        candidates.extend(self._reference_based_quizzes(request, q_type, references))
+        generic = self._generic_backup_quizzes(request, q_type, ref_titles)
+        candidates.extend(generic)
+
+        selected: list[QuizQuestionItem] = []
+        for cand in candidates:
+            if cand.question in used:
+                continue
+            used.add(cand.question)
+            selected.append(cand)
+            if len(selected) >= count:
+                return selected
+        while generic and len(selected) < count:
+            selected.append(generic[len(selected) % len(generic)])
+        return selected
+
+    def _reference_based_quizzes(
+        self, request: QuizGenerateRequest, q_type: str, references: list[RetrievedReference]
+    ) -> list[QuizQuestionItem]:
+        """검색된 참고 지식 청크 본문으로 요청 유형의 문항을 구성한다."""
+        label_prefix = f"[{request.category}{' - ' + request.domain if request.domain else ''}]"
+        quizzes: list[QuizQuestionItem] = []
+
+        if q_type == "descriptive":
+            for ref in references:
+                sentences = _reference_sentences(ref)
+                if len(sentences) < 2:
+                    continue
+                label = _reference_label(ref)
+                keywords = [(m.group(1) or m.group(2)).strip() for m in _INLINE_TERM.finditer(ref.content)]
+                quizzes.append(
+                    QuizQuestionItem(
+                        id=0,
+                        question=f"{label_prefix} '{label}'와(과) 관련하여 핵심 개념, 실무에서 발생할 수 있는 문제 상황, 확인 및 해결 방법을 순서대로 설명하시오.",
+                        type="descriptive",
+                        options=None,
+                        answer=" ".join(_plain(s) for s in sentences[:4]),
+                        explanation=f"참고 지식 '{label}'를 근거로 한 모범 답안입니다. 핵심 키워드와 확인 순서가 포함되었는지를 기준으로 채점합니다.",
+                        references=[label],
+                        gradingKeywords=list(dict.fromkeys(keywords))[:5] or [label],
+                    )
+                )
+        elif q_type in ("blank", "short_answer"):
+            for ref in references:
+                label = _reference_label(ref)
+                for sentence in _reference_sentences(ref):
+                    match = _INLINE_TERM.search(sentence)
+                    if match is None:
+                        continue
+                    term = (match.group(1) or match.group(2)).strip()
+                    if q_type == "blank":
+                        question = f"{label_prefix} 다음 빈칸에 들어갈 알맞은 용어를 쓰시오.\n{_plain(sentence.replace(match.group(0), '___', 1))}"
+                    else:
+                        question = f"{label_prefix} 다음 설명에서 가리키는 핵심 용어/명령어를 쓰시오.\n{_plain(sentence.replace(match.group(0), '(   )', 1))}"
+                    quizzes.append(
+                        QuizQuestionItem(
+                            id=0,
+                            question=question,
+                            type=q_type,
+                            options=None,
+                            answer=term,
+                            explanation=f"원문: {_plain(sentence)} (참고 지식 '{label}')",
+                            references=[label],
+                        )
+                    )
+                    break
+        elif q_type == "multiple_choice":
+            labeled = [(ref, _reference_label(ref)) for ref in references]
+            labels = list(dict.fromkeys(label for _, label in labeled))
+            if len(labels) >= 4:
+                for idx, (ref, label) in enumerate(labeled):
+                    sentences = _reference_sentences(ref)
+                    if not sentences:
+                        continue
+                    distractors = [lb for lb in labels if lb != label][:3]
+                    choices = distractors[:]
+                    answer_pos = idx % 4
+                    choices.insert(answer_pos, label)
+                    quizzes.append(
+                        QuizQuestionItem(
+                            id=0,
+                            question=f"{label_prefix} 다음 설명이 다루는 실무 주제로 가장 적절한 것은?\n\"{_plain(sentences[0])}\"",
+                            type="multiple_choice",
+                            options=[f"{i}. {c}" for i, c in enumerate(choices, 1)],
+                            answer=str(answer_pos + 1),
+                            explanation=f"제시된 설명은 참고 지식 '{label}'의 내용입니다.",
+                            references=[label],
+                        )
+                    )
+        return quizzes
+
+    def _generic_backup_quizzes(
+        self, request: QuizGenerateRequest, q_type: str, ref_titles: list[str]
+    ) -> list[QuizQuestionItem]:
+        """참고 지식도 없을 때 사용하는 도메인 중립 실무 문항."""
+        topic = request.domain or request.category
+        refs = ref_titles[:2] or [topic]
+        if q_type == "multiple_choice":
+            return [
+                QuizQuestionItem(
+                    id=0,
+                    question=f"[{topic}] 운영 중인 서비스에 장애가 발생했을 때 가장 먼저 수행해야 할 조치로 가장 적절한 것은?",
+                    type="multiple_choice",
+                    options=[
+                        "1. 현재 상태와 로그를 확인해 증상과 영향 범위를 파악한다.",
+                        "2. 원인 확인 없이 서버를 즉시 재생성한다.",
+                        "3. 모든 설정 파일을 초기값으로 되돌린다.",
+                        "4. 동일한 배포를 원인 파악 없이 반복 실행한다.",
+                    ],
+                    answer="1",
+                    explanation="장애 대응은 상태·로그 확인으로 증상과 범위를 파악한 뒤 원인을 좁혀 가는 것이 기본입니다. 확인 없이 재생성·초기화하면 원인 분석에 필요한 정보가 사라집니다.",
+                    references=refs,
+                )
+            ]
+        if q_type == "ox":
+            return [
+                QuizQuestionItem(
+                    id=0,
+                    question=f"[{topic}] 장애 원인을 확인하기 전에 서버를 재시작하면 원인 분석에 필요한 로그나 상태 정보가 사라질 수 있다.",
+                    type="ox",
+                    options=["1. O", "2. X"],
+                    answer="1",
+                    explanation="재시작 전에 로그와 상태를 먼저 확보해야 원인을 분석할 수 있습니다.",
+                    references=refs,
+                )
+            ]
+        if q_type in ("blank", "short_answer"):
+            marker = "___" if q_type == "blank" else "(   )"
+            return [
+                QuizQuestionItem(
+                    id=0,
+                    question=f"[{topic}] 애플리케이션 실행 중 발생한 이벤트와 오류를 시간순으로 기록하여 장애 원인 분석에 사용하는 데이터를 {marker}(이)라고 한다.",
+                    type=q_type,
+                    options=None,
+                    answer="로그",
+                    explanation="로그(log)는 장애 분석의 1차 근거이며, 오류 메시지와 발생 시각으로 원인을 좁힐 수 있습니다.",
+                    references=refs,
+                )
+            ]
+        return [
+            QuizQuestionItem(
+                id=0,
+                question=f"[{topic}] 운영 중인 서비스에 외부에서 접속할 수 없다는 장애가 보고되었다. 원인을 찾기 위해 확인해야 할 항목과 순서를 실무 관점에서 설명하시오.",
+                type="descriptive",
+                options=None,
+                answer="먼저 애플리케이션 프로세스/컨테이너가 실행 중인지 상태를 확인한다. 이어서 애플리케이션 로그로 오류 여부를 확인한다. 로컬에서 서비스 포트로 직접 요청해 애플리케이션 자체의 응답을 확인한다. 이후 포트 바인딩, 방화벽/보안 규칙, 로드밸런서 헬스 체크, DNS 등 외부 경로를 안쪽에서 바깥쪽 순서로 점검한다.",
+                explanation="안쪽(프로세스·로그)에서 바깥쪽(네트워크·보안 규칙·DNS) 순서로 점검하면 원인 범위를 효율적으로 좁힐 수 있습니다.",
+                references=refs,
+                gradingKeywords=["상태 확인", "로그", "포트", "방화벽/보안 규칙", "헬스 체크"],
+            )
+        ]
 
     def _generate_fallback_quizzes(
         self, request: QuizGenerateRequest, ref_titles: list[str]
