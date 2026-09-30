@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 
 from app.models.enums import QuestionType
 from app.schemas.evaluation import (
     CodeAnalyzeRequest,
     CodeAnalyzeResponse,
+    JavaCodeGradingRequest,
+    JavaCodeGradingResponse,
     QuizGradeRequest,
     QuizGradeResponse,
 )
@@ -16,12 +20,17 @@ from app.services.evaluation_payload_normalizer import (
     extract_answer_keywords,
     normalize_answer_text,
 )
+from app.services.llm_service import LLMService
 
 __all__ = [
     "EvaluationService",
     "CodeAnalyzeRequest",
     "CodeAnalyzeResponse",
+    "JavaCodeGradingRequest",
+    "JavaCodeGradingResponse",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 # 개념 키워드별 한 문장 코칭 설명. normalize_answer_text 가 한글 동의어를
@@ -386,3 +395,119 @@ class EvaluationService:
         다루지 않으며, 그 책임은 /ai/mission/feedback 에 있다.
         """
         return CodeAnalyzeService().analyze(request)
+
+    def grade_java_code(self, request: JavaCodeGradingRequest) -> JavaCodeGradingResponse:
+        """LLM 기반 자바 코드 정적 분석 및 채점.
+
+        평가 기준(criteria)에 따라 자바 코드를 분석하고 점수를 부여한다.
+        """
+        from app.prompts.code_analyze_prompts import build_java_code_grading_prompt
+
+        llm = LLMService()
+        
+        # 프롬프트 구성
+        prompt = build_java_code_grading_prompt(
+            code=request.code,
+            criteria=request.criteria,
+        )
+        
+        try:
+            # LLM 호출
+            system_prompt = "너는 자바 코딩테스트 채점 전문가다."
+            raw_response = llm.generate_text(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                timeout_seconds=60,
+            )
+            
+            # JSON 파싱
+            parsed = self._extract_json_from_response(raw_response)
+            
+            # 응답 객체 생성
+            return JavaCodeGradingResponse(
+                is_correct=parsed.get("is_correct", False),
+                score=self._validate_score(parsed.get("score", 0)),
+                feedback=parsed.get("feedback", "채점 피드백을 생성할 수 없었습니다."),
+                formatted_code=parsed.get("formatted_code", request.code),
+            )
+            
+        except Exception as exc:
+            logger.error("Java code grading failed: %s", exc)
+            # 실패 시 fallback 응답
+            return self._generate_fallback_grading_response(request)
+
+    def _extract_json_from_response(self, text: str) -> dict:
+        """LLM 응답에서 JSON을 추출한다."""
+        # 마크다운 코드블록 제거
+        cleaned = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("```", "").strip()
+        
+        # JSON 파싱 시도
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            # { } 객체 추출 시도
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    return json.loads(cleaned[start:end+1])
+                except json.JSONDecodeError:
+                    pass
+        
+        logger.warning("Failed to extract JSON from LLM response: %s", cleaned[:200])
+        return {}
+
+    def _validate_score(self, score: int) -> int:
+        """점수가 0~100 범위 내에 있는지 확인한다."""
+        try:
+            score_int = int(score)
+            return max(0, min(100, score_int))
+        except (ValueError, TypeError):
+            return 0
+
+    def _generate_fallback_grading_response(self, request: JavaCodeGradingRequest) -> JavaCodeGradingResponse:
+        """LLM 실패 시 fallback 채점 응답을 생성한다."""
+        # 간단한 규칙 기반 채점
+        code_lower = request.code.lower()
+        
+        # 기본 점수
+        score = 0
+        feedback_parts = []
+        
+        # 정수형 변수 선언 확인
+        if any(keyword in code_lower for keyword in ["int ", "long ", "short ", "byte "]):
+            score += 25
+            feedback_parts.append("정수형 변수 선언이 확인되었습니다.")
+        else:
+            feedback_parts.append("정수형 변수 선언이 없습니다.")
+        
+        # 조건문 확인
+        if "if " in code_lower:
+            score += 25
+            feedback_parts.append("조건문(if)이 사용되었습니다.")
+        else:
+            feedback_parts.append("조건문(if)이 없습니다.")
+        
+        # 반복문 확인
+        if any(keyword in code_lower for keyword in ["for ", "while "]):
+            score += 25
+            feedback_parts.append("반복문(for/while)이 사용되었습니다.")
+        else:
+            feedback_parts.append("반복문(for/while)이 없습니다.")
+        
+        # 들여쓰기 기본 확인
+        if "\t" in request.code or "    " in request.code:
+            score += 25
+            feedback_parts.append("기본적인 들여쓰기가 확인되었습니다.")
+        else:
+            feedback_parts.append("들여쓰기가 부족합니다.")
+        
+        feedback = " ".join(feedback_parts)
+        
+        return JavaCodeGradingResponse(
+            is_correct=score >= 75,
+            score=score,
+            feedback=feedback,
+            formatted_code=request.code,
+        )

@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.feature_template import (
     ApiSpecSchema,
@@ -24,6 +24,8 @@ __all__ = [
     "CodeAnalyzeResponse",
     "InterviewFeedbackRequest",
     "InterviewFeedbackResponse",
+    "JavaCodeGradingRequest",
+    "JavaCodeGradingResponse",
 ]
 
 
@@ -136,3 +138,36 @@ class InterviewFeedbackResponse(BaseModel):
     missingKeyPoints: list[str]
     feedback: str
     improvedAnswer: str
+
+
+class JavaCodeGradingRequest(BaseModel):
+    """자바 코딩테스트 채점 요청 스키마."""
+    
+    code: str = Field(..., description="채점할 자바 코드")
+    criteria: list[str] = Field(
+        default_factory=list,
+        description="평가 기준 리스트 (예: 정수형 변수 선언, 조건문 사용, 반복문 사용 등)"
+    )
+    
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("code는 비어 있을 수 없습니다.")
+        return v.strip()
+    
+    @field_validator("criteria")
+    @classmethod
+    def validate_criteria(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("criteria는 최소 1개 이상의 평가 기준이 필요합니다.")
+        return [item.strip() for item in v if item and item.strip()]
+
+
+class JavaCodeGradingResponse(BaseModel):
+    """자바 코딩테스트 채점 응답 스키마."""
+    
+    is_correct: bool = Field(..., description="코드가 평가 기준을 모두 충족하는지 여부")
+    score: int = Field(..., ge=0, le=100, description="0~100 사이의 점수")
+    feedback: str = Field(..., description="채점 피드백 및 개선 제안")
+    formatted_code: str = Field(..., description="포맷팅된 코드")

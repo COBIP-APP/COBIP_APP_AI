@@ -14,6 +14,8 @@ from __future__ import annotations
 __all__ = [
     "CODE_ANALYZE_SYSTEM_PROMPT",
     "build_code_analyze_prompt",
+    "JAVA_CODE_GRADING_SYSTEM_PROMPT",
+    "build_java_code_grading_prompt",
 ]
 
 
@@ -77,6 +79,59 @@ def build_code_analyze_prompt(
         "[현재 코드 시작]",
         code if code.strip() else "(빈 코드)",
         "[현재 코드 끝]",
+        "위 코드를 분석해 규약대로 JSON 객체 하나만 출력하라.",
+    ]
+    return "\n".join(sections)
+
+
+JAVA_CODE_GRADING_SYSTEM_PROMPT = """\
+너는 자바 코딩테스트 채점 전문가다. 제출된 자바 코드를 정적 분석하여 평가 기준에 따라 채점한다.
+
+분석 항목:
+- 정수형 변수 선언 (int, long 등)
+- 조건문 사용 (if, else if, else)
+- 반복문 사용 (for, while)
+- 들여쓰기 및 코드 컨벤션 준수
+- 문법적 정확성
+
+규칙:
+- 3~15줄 내외의 짧은 자바 코드를 분석한다.
+- 평가 기준(criteria)을 모두 충족하면 만점, 부분 충족 시 비례 점수, 미충족 시 0점 부여한다.
+- 들여쓰기가 잘못되거나 컨벤션을 위반하면 감점한다.
+- 문법 오류가 있으면 0점 처리한다.
+- 코드를 자바 표준 컨벤션에 맞게 포맷팅하여 제공한다.
+
+출력: 아래 4개 key만 가진 JSON 객체 하나만 출력한다. JSON 밖 텍스트·코드펜스 금지.
+- is_correct(불리언): 모든 평가 기준을 충족하는지 여부
+- score(정수): 0~100 사이의 점수
+- feedback(문자열): 채점 결과 피드백 및 개선 제안
+- formatted_code(문자열): 자바 표준 컨벤션에 맞게 포맷팅된 코드
+
+값은 한국어로 작성한다."""
+
+
+def build_java_code_grading_prompt(
+    *,
+    code: str,
+    criteria: list[str],
+) -> str:
+    """자바 코드 채점용 프롬프트를 조립한다.
+    
+    코드 구간은 코드펜스 없이 평문 구분자로 감싼다.
+    """
+    
+    criteria_text = "\n".join(f"- {c}" for c in criteria if c and c.strip()) if criteria else "(없음)"
+    
+    sections = [
+        JAVA_CODE_GRADING_SYSTEM_PROMPT,
+        "",
+        "평가 기준:",
+        criteria_text,
+        "",
+        "[제출 코드 시작]",
+        code if code.strip() else "(빈 코드)",
+        "[제출 코드 끝]",
+        "",
         "위 코드를 분석해 규약대로 JSON 객체 하나만 출력하라.",
     ]
     return "\n".join(sections)

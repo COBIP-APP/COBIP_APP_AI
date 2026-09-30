@@ -1,24 +1,30 @@
-"""보조 Q&A 챗봇 라우터 (Ollama 기반, 룰 기반 AgentOrchestrator).
+"""실무 RAG Q&A 챗봇 라우터.
 
-⚠️ 챗봇은 이 시스템의 핵심 기능이 아니라 보조 Q&A 기능이다.
-핵심은 기능템플릿 생성·문법 문제 생성/채점·미션/면접 피드백이며,
-이 라우터의 우선순위는 그보다 항상 낮다.
+Qdrant Top-3 검색 기반 → 모바일 친화적 마크다운 응답.
+페르소나: 10년 경력 시니어 개발자 멘토
 """
 
 from fastapi import APIRouter
 
 from app.schemas.chat import ChatRequest
 from app.schemas.common import ApiResponse
-from app.services.agent_orchestrator import AgentOrchestrator
+from app.services.rag_chat_service import RagChatService
 
 router = APIRouter(prefix="/ai", tags=["chat"])
 
 
 @router.post("/chat", response_model=ApiResponse)
 async def chat(request: ChatRequest) -> ApiResponse:
-    result = await AgentOrchestrator().run_chat(request)
+    """Qdrant 지식 기반 실무 Q&A 챗봇.
+
+    - Qdrant에서 관련 청크 Top-3 검색
+    - 시니어 개발자 멘토 페르소나로 응답
+    - 모바일 친화 마크다운: 핵심 키워드 볼드, 3문장 요약, 코드 예시 1개
+    """
+    service = RagChatService()
+    result = await service.answer(request)
     return ApiResponse(
         success=True,
         message="챗봇 답변이 생성되었습니다.",
-        data=result.model_dump(),
+        data=result,
     )

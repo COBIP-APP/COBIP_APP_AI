@@ -42,14 +42,28 @@ class QdrantService:
             return None
         if self._client is not None:
             return self._client
+
+        # 1. 원격 Qdrant 서버 연결 시도
         try:
-            self._client = QdrantClient(
+            client = QdrantClient(
                 url=settings.QDRANT_URL,
-                timeout=10,
+                timeout=3,
                 check_compatibility=False,
             )
+            client.get_collections()
+            self._client = client
             host = urlparse(settings.QDRANT_URL).hostname or "unknown"
-            logger.info("qdrant client ready host=%s", host)
+            logger.info("qdrant client ready (remote host=%s)", host)
+            return self._client
+        except Exception as remote_exc:
+            logger.info("remote qdrant unreachable (%s), falling back to local persistent embedded storage", remote_exc)
+
+        # 2. 로컬 임베디드 모드 fallback (data/qdrant_storage)
+        try:
+            import os
+            os.makedirs("data/qdrant_storage", exist_ok=True)
+            self._client = QdrantClient(path="data/qdrant_storage")
+            logger.info("qdrant client ready (local embedded path=data/qdrant_storage)")
             return self._client
         except Exception as exc:
             self._client_init_error = type(exc).__name__

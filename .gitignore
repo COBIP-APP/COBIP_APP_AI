@@ -14,6 +14,15 @@ venv/
 env/
 ENV/
 
+# Dependencies
+requirements.txt
+
+# Docker
+docker-compose.yml
+docker-compose.*.yml
+Dockerfile
+.dockerignore
+
 # FastAPI / logs
 *.log
 logs/
@@ -40,3 +49,8 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Data & Qdrant storage
+data/qdrant_storage/
+data/qdrant_storage/.lock
+data/qdrant_storage/meta.json

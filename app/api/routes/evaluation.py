@@ -1,7 +1,12 @@
 from fastapi import APIRouter
 
 from app.schemas.common import ApiResponse
-from app.schemas.evaluation import MissionFeedbackRequest, QuizGradeRequest
+from app.schemas.evaluation import (
+    JavaCodeGradingRequest,
+    JavaCodeGradingResponse,
+    MissionFeedbackRequest,
+    QuizGradeRequest,
+)
 from app.services.evaluation_service import (
     CodeAnalyzeRequest,
     EvaluationService,
@@ -51,5 +56,16 @@ def analyze_code(request: CodeAnalyzeRequest) -> ApiResponse:
     return ApiResponse(
         success=True,
         message="코드 분석이 완료되었습니다.",
+        data=result.model_dump(),
+    )
+
+
+@router.post("/java/grade", response_model=ApiResponse)
+def grade_java_code(request: JavaCodeGradingRequest) -> ApiResponse:
+    """자바 코딩테스트 채점 API - LLM 기반 정적 분석"""
+    result = EvaluationService().grade_java_code(request)
+    return ApiResponse(
+        success=True,
+        message="자바 코드 채점이 완료되었습니다.",
         data=result.model_dump(),
     )
