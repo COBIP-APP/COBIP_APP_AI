@@ -1,7 +1,7 @@
 # Environment
 .env
 .env.*
-!.env.example
+.env.example
 
 # Python
 __pycache__/
@@ -22,6 +22,9 @@ docker-compose.yml
 docker-compose.*.yml
 Dockerfile
 .dockerignore
+
+# CI/CD Workflows
+.github/
 
 # FastAPI / logs
 *.log
@@ -52,5 +55,5 @@ dist/
 
 # Data & Qdrant storage
 data/qdrant_storage/
-data/qdrant_storage/.lock
-data/qdrant_storage/meta.json
+
+desktop.ini
