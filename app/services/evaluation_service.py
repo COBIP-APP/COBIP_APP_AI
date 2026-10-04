@@ -14,8 +14,10 @@ from app.models.enums import QuestionType
 from app.prompts.quiz_grade_prompts import (
     QUIZ_ANSWER_GRADING_SYSTEM_PROMPT,
     QUIZ_CRITERIA_SYSTEM_PROMPT,
+    QUIZ_SEMANTIC_EQUIVALENCE_SYSTEM_PROMPT,
     build_quiz_answer_grading_prompt,
     build_quiz_criteria_prompt,
+    build_quiz_semantic_equivalence_prompt,
 )
 from app.schemas.evaluation import (
     CodeAnalyzeRequest,
@@ -49,7 +51,7 @@ _T = TypeVar("_T")
 GradingMethod = Literal["rule", "ai", "rule_fallback"]
 GradeResult = Literal["CORRECT", "PARTIAL", "INCORRECT"]
 
-# 정규화 완전 일치가 아니면 AI criteria 채점을 시도하는 유형.
+# 정규화 완전 일치가 아니면 AI 채점을 시도하는 유형.
 # MULTIPLE_CHOICE / OX 는 항상 rule 채점.
 _AI_GRADED_TYPES: frozenset[QuestionType] = frozenset(
     {
@@ -62,12 +64,23 @@ _AI_GRADED_TYPES: frozenset[QuestionType] = frozenset(
     }
 )
 
+# 위 유형 중 criteria 채점 대신 의미 동등성 판정(1회 호출, 100/0점)을 쓰는 유형.
+_SEMANTIC_GRADED_TYPES: frozenset[QuestionType] = frozenset(
+    {
+        QuestionType.SHORT_ANSWER,
+        QuestionType.FILL_BLANK,
+    }
+)
+
 _MAX_CRITERIA = 5
 _CORRECT_MIN_SCORE = 80
 _PARTIAL_MIN_SCORE = 40
 _LLM_JSON_MAX_ATTEMPTS = 2
 _CRITERIA_MAX_TOKENS = 512
 _GRADING_MAX_TOKENS = 1024
+_SEMANTIC_MAX_TOKENS = 64
+_SEMANTIC_CORRECT_FEEDBACK = "정답입니다. 모범 답안과 의미상 동일한 표현입니다."
+_SEMANTIC_WRONG_FEEDBACK = "오답입니다. 모범 답안은 '{correct_answer}'입니다."
 _LOG_ERROR_MAX_CHARS = 300
 _CRITERION_FEEDBACK_MAX_CHARS = 500
 _MIN_CRITERION_CHARS = 6
@@ -126,6 +139,7 @@ class EvaluationService:
         """유형별 rule / AI criteria 혼합 채점. 응답은 기존 6개 필드만 반환한다.
 
         - MULTIPLE_CHOICE / OX, 빈 답안, 정규화 완전 일치: rule
+        - SHORT_ANSWER / FILL_BLANK: AI 의미 동등성 판정 1회 (100 / 0점)
         - 그 외 _AI_GRADED_TYPES: AI 2단계(criteria 생성 → 기준별 평가)
         - AI 호출·파싱·검증 실패: 기존 _grade_answer 로 rule_fallback
         """
@@ -151,8 +165,13 @@ class EvaluationService:
                 grading_method="rule",
             )
 
+        grade_with_ai = (
+            self._grade_quiz_with_semantic
+            if q_type in _SEMANTIC_GRADED_TYPES
+            else self._grade_quiz_with_ai
+        )
         try:
-            ai_outcome = self._grade_quiz_with_ai(
+            ai_outcome = grade_with_ai(
                 request,
                 correct_answer=correct_answer,
                 user_answer=user_answer,
@@ -245,6 +264,66 @@ class EvaluationService:
     @staticmethod
     def _split_blank_answers(text: str) -> list[str]:
         return [part for part in re.split(r"\s*[,，]\s*", text.strip()) if part]
+
+    # ------------------------------------------------------------------
+    # AI 의미 동등성 판정 (SHORT_ANSWER / FILL_BLANK)
+    # ------------------------------------------------------------------
+    def _grade_quiz_with_semantic(
+        self,
+        request: QuizGradeRequest,
+        *,
+        correct_answer: str,
+        user_answer: str,
+    ) -> _QuizGradeOutcome | None:
+        """AI 는 isEquivalent 만 판정한다. 점수·feedback 은 서버가 고정 규칙으로 만든다."""
+        question = request.question
+        prompt = build_quiz_semantic_equivalence_prompt(
+            question=(question.question or "").strip(),
+            correct_answer=correct_answer,
+            user_answer=user_answer,
+        )
+        try:
+            is_equivalent = self._call_llm_json(
+                prompt=prompt,
+                system_prompt=QUIZ_SEMANTIC_EQUIVALENCE_SYSTEM_PROMPT,
+                validator=self._validate_equivalence,
+                max_tokens=_SEMANTIC_MAX_TOKENS,
+            )
+        except (RuntimeError, ValueError) as exc:
+            self._log_ai_failure(stage="semantic", q_type=question.type, exc=exc)
+            return None
+
+        score = 100 if is_equivalent else 0
+        result: GradeResult = "CORRECT" if is_equivalent else "INCORRECT"
+        feedback = (
+            _SEMANTIC_CORRECT_FEEDBACK
+            if is_equivalent
+            else _SEMANTIC_WRONG_FEEDBACK.format(correct_answer=correct_answer)
+        )
+        logger.info(
+            "quiz_grade type=%s method=ai mode=semantic score=%d result=%s",
+            question.type.value,
+            score,
+            result,
+        )
+        response = QuizGradeResponse(
+            isCorrect=is_equivalent,
+            score=score,
+            feedback=feedback,
+            correctAnswer=correct_answer,
+            explanation=self._quiz_explanation(request, correct_answer),
+            relatedSection=question.relatedSection,
+        )
+        return _QuizGradeOutcome(response=response, grading_method="ai", result=result)
+
+    @staticmethod
+    def _validate_equivalence(data: dict) -> bool:
+        value = data.get("isEquivalent")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+            return value.strip().lower() == "true"
+        raise ValueError("isEquivalent 는 true/false 여야 합니다")
 
     # ------------------------------------------------------------------
     # AI criteria 채점

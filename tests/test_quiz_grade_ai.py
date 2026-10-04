@@ -1,4 +1,4 @@
-"""/ai/quiz/grade rule + AI criteria 혼합 채점 테스트 (Fake LLM, 실제 Ollama 호출 없음)."""
+"""/ai/quiz/grade rule + AI(의미 동등성 / criteria) 혼합 채점 테스트 (Fake LLM, 실제 Ollama 호출 없음)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from app.models.enums import QuestionType
 from app.prompts.quiz_grade_prompts import (
     QUIZ_ANSWER_GRADING_SYSTEM_PROMPT,
     QUIZ_CRITERIA_SYSTEM_PROMPT,
+    QUIZ_SEMANTIC_EQUIVALENCE_SYSTEM_PROMPT,
 )
 from app.schemas.evaluation import QuizGradeCriterion, QuizGradeRequest
 from app.services import evaluation_service as evaluation_service_module
@@ -98,6 +99,10 @@ def _grade_json(scores: dict[int, int], *, total: int | None = None, result: str
     )
 
 
+def _equiv_json(value: object) -> str:
+    return json.dumps({"isEquivalent": value})
+
+
 def _request(
     q_type: str = "descriptive",
     answer: str = "int score = 65; if (score > 60) 합격 출력",
@@ -174,13 +179,13 @@ class TestRouting:
         assert result.gradingMethod == "rule"
         assert fake.calls == []
 
-    def test_multi_blank_swapped_order_goes_to_ai(self) -> None:
-        _, fake = _grade(
+    def test_multi_blank_swapped_order_goes_to_semantic_ai(self) -> None:
+        result, fake = _grade(
             _request("fill_blank", answer="MVCC, 스냅샷", user_answer="스냅샷, MVCC"),
-            _criteria_json(("첫 번째 빈칸에 MVCC를 채웠는가", 50), ("두 번째 빈칸에 스냅샷을 채웠는가", 50)),
-            _grade_json({1: 0, 2: 0}),
+            _equiv_json(False),
         )
-        assert len(fake.calls) == 2
+        assert (result.score, result.gradingMethod) == (0, "ai")
+        assert len(fake.calls) == 1
 
     @pytest.mark.parametrize("q_type", ["descriptive", "output_prediction", "code_fill"])
     def test_exact_match_skips_ai_for_descriptive_and_code(self, q_type: str) -> None:
@@ -206,8 +211,7 @@ class TestRouting:
         assert fake.calls == []
 
     @pytest.mark.parametrize(
-        "q_type",
-        ["short_answer", "fill_blank", "descriptive", "output_prediction", "code_error_find", "code_fill"],
+        "q_type", ["descriptive", "output_prediction", "code_error_find", "code_fill"]
     )
     def test_ai_types_use_two_stage_ai(self, q_type: str) -> None:
         result, fake = _grade(_request(q_type), CRITERIA_3, _grade_json({1: 30, 2: 40, 3: 30}))
@@ -215,6 +219,98 @@ class TestRouting:
         assert len(fake.calls) == 2
         assert fake.calls[0]["system_prompt"] == QUIZ_CRITERIA_SYSTEM_PROMPT
         assert fake.calls[1]["system_prompt"] == QUIZ_ANSWER_GRADING_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# 단답형 / 빈칸: 의미 동등성 판정
+# ---------------------------------------------------------------------------
+class TestSemanticEquivalence:
+    @pytest.mark.parametrize("q_type", ["fill_blank", "short_answer"])
+    @pytest.mark.parametrize(
+        "user_answer", ["다중 버전 동시성 제어", "Multi-Version Concurrency Control"]
+    )
+    def test_equivalent_expression_is_100(self, q_type: str, user_answer: str) -> None:
+        result, fake = _grade(_request(q_type, answer="MVCC", user_answer=user_answer), _equiv_json(True))
+        assert (result.isCorrect, result.score, result.gradingMethod, result.result) == (
+            True, 100, "ai", "CORRECT",
+        )
+        assert result.feedback == "정답입니다. 모범 답안과 의미상 동일한 표현입니다."
+        assert result.criteriaResults == []
+        assert len(fake.calls) == 1
+
+    @pytest.mark.parametrize("q_type", ["fill_blank", "short_answer"])
+    def test_different_concept_is_0(self, q_type: str) -> None:
+        result, fake = _grade(_request(q_type, answer="MVCC", user_answer="MVC"), _equiv_json(False))
+        assert (result.isCorrect, result.score, result.gradingMethod, result.result) == (
+            False, 0, "ai", "INCORRECT",
+        )
+        assert result.feedback == "오답입니다. 모범 답안은 'MVCC'입니다."
+        assert len(fake.calls) == 1
+
+    @pytest.mark.parametrize("q_type", ["fill_blank", "short_answer"])
+    def test_exact_match_calls_ai_zero_times(self, q_type: str) -> None:
+        result, fake = _grade(_request(q_type, answer="MVCC", user_answer="mvcc"))
+        assert (result.score, result.gradingMethod) == (100, "rule")
+        assert fake.calls == []
+
+    def test_semantic_prompt_inputs_and_no_criteria_call(self) -> None:
+        _, fake = _grade(
+            _request("fill_blank", answer="MVCC", user_answer=_USER_SECRET), _equiv_json(True)
+        )
+        assert len(fake.calls) == 1
+        call = fake.calls[0]
+        assert call["system_prompt"] == QUIZ_SEMANTIC_EQUIVALENCE_SYSTEM_PROMPT
+        assert call["max_tokens"] == 64
+        assert call["timeout_seconds"] == 60
+        prompt = call["prompt"]
+        assert "[문제 시작]\nscore가 60보다 크면" in prompt
+        assert "[모범답안 시작]\nMVCC\n[모범답안 끝]" in prompt
+        assert f"[학생 답안 시작]\n{_USER_SECRET}\n[학생 답안 끝]" in prompt
+        assert "65 > 60" not in prompt  # explanation 미전달
+        assert "빈칸" not in prompt
+
+    def test_ai_score_and_feedback_are_ignored(self) -> None:
+        raw = json.dumps({"isEquivalent": False, "score": 40, "feedback": "쉼표로 여러 빈칸을 구분하세요"})
+        result, _ = _grade(_request("fill_blank", answer="MVCC", user_answer="MVC"), raw)
+        assert result.score == 0
+        assert "쉼표" not in result.feedback
+
+    def test_string_boolean_accepted(self) -> None:
+        result, _ = _grade(_request("short_answer", answer="MVCC", user_answer="다중 버전 동시성 제어"),
+                           '{"isEquivalent": "true"}')
+        assert result.score == 100
+
+    def test_invalid_response_retried_once_then_success(self) -> None:
+        result, fake = _grade(
+            _request("fill_blank", answer="MVCC", user_answer="다중 버전 동시성 제어"),
+            '{"equivalent": true}',
+            _equiv_json(True),
+        )
+        assert (result.score, result.gradingMethod) == (100, "ai")
+        assert len(fake.calls) == 2
+        assert "[주의" in fake.calls[1]["prompt"]
+
+    def test_invalid_response_twice_falls_back_to_rule(self) -> None:
+        request = _request("fill_blank", answer="MVCC", user_answer="MVC")
+        result, fake = _grade(request, '{"isEquivalent": 1}', "JSON 아님")
+        assert result.gradingMethod == "rule_fallback"
+        assert len(fake.calls) == 2
+        expected = EvaluationService(llm_service=FakeLLM())._grade_answer(
+            correct_answer="MVCC", user_answer="MVC", question_type=QuestionType.FILL_BLANK, choices=None
+        )
+        assert (result.isCorrect, result.score) == expected
+
+    def test_timeout_falls_back_without_retry(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="app.services.evaluation_service"):
+            result, fake = _grade(
+                _request("short_answer", answer="MVCC", user_answer=_USER_SECRET),
+                RuntimeError("LLM 호출 타임아웃 (60s 초과)"),
+            )
+        assert result.gradingMethod == "rule_fallback"
+        assert len(fake.calls) == 1
+        warning = next(r.getMessage() for r in caplog.records if "AI failed" in r.getMessage())
+        assert "stage=semantic" in warning
+        assert all(_USER_SECRET not in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +663,29 @@ class TestQuizGradeAiApi:
         assert data["isCorrect"] is False
         assert data["feedback"] == ">=는 60도 합격 처리합니다."
         assert len(fake.calls) == 2
+
+    def test_blank_semantic_contract(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakeLLM(_equiv_json(True))
+        payload = {
+            "category": "DB",
+            "difficulty": "중급",
+            "question": {
+                "id": 2,
+                "type": "blank",
+                "question": "여러 버전의 데이터를 유지해 읽기와 쓰기가 서로 막지 않게 하는 기법은 ____이다.",
+                "options": None,
+                "answer": "MVCC",
+                "explanation": "",
+            },
+            "userAnswer": "다중 버전 동시성 제어",
+        }
+        resp = self._client_with(monkeypatch, fake).post("/ai/quiz/grade", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert set(data) == _LEGACY_FIELDS
+        assert (data["isCorrect"], data["score"]) == (True, 100)
+        assert data["feedback"] == "정답입니다. 모범 답안과 의미상 동일한 표현입니다."
+        assert len(fake.calls) == 1
 
     def test_ai_failure_still_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = FakeLLM(RuntimeError("HTTP 500"))
