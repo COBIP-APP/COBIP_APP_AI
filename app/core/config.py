@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     # RAG: Retriever 연동 전 토글·파라미터
     RAG_ENABLED: bool = False
     RAG_TOP_K: int = 3
+    # /ai/chat 전용: 이 score 미만 검색 결과는 prompt/references 에서 제외
+    CHAT_RAG_MIN_SCORE: float = 0.55
 
     # Agentic RAG 15차: 기능템플릿 전용 RAG 검색·프롬프트 방어 파라미터
     FEATURE_TEMPLATE_RAG_TOP_K: int = 3

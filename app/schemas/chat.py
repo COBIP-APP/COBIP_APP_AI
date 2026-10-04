@@ -50,7 +50,7 @@ class AgentPayload(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """챗봇 요청 (선택 context·useRag; RAG는 RAG_ENABLED=true일 때만 검색)."""
+    """챗봇 요청 (선택 context·useRag)."""
 
     message: str = Field(..., description="사용자 질문")
     context: str | None = Field(
@@ -59,7 +59,10 @@ class ChatRequest(BaseModel):
     )
     useRag: bool | None = Field(
         default=None,
-        description="GENERAL_CHAT intent일 때만 적용: true 이고 RAG_ENABLED=true이면 Retriever 검색 후 주입",
+        description=(
+            "false: RAG 미사용 / true: 질문 유형과 무관하게 검색 시도(threshold 적용) / "
+            "null: TECHNICAL 질문일 때만 검색 시도"
+        ),
     )
 
     @field_validator("message")
@@ -73,16 +76,26 @@ class ChatRequest(BaseModel):
 
 class ChatResponseData(BaseModel):
     answer: str
-    source: Literal["ollama", "fallback"]
+    source: Literal["ollama", "rag", "fallback"] = Field(
+        ...,
+        description=(
+            "ollama: RAG 없이 LLM 생성 / rag: threshold 통과 문서 + LLM 생성 / "
+            "fallback: LLM 실패·빈 응답으로 고정 문구 반환"
+        ),
+    )
     ragUsed: bool = Field(
         default=False,
-        description="Retriever가 실제로 사용되어 근거가 주입된 경우 true",
+        description="threshold 를 통과한 RAG context 로 LLM 답변이 생성된 경우에만 true",
     )
     references: list[Any] = Field(
         default_factory=list,
-        description="RAG 검색 근거(제목·내용·score 등); 미사용 시 빈 배열",
+        description="실제로 prompt 에 들어간 RAG 근거(제목·내용·score 등); 미사용 시 빈 배열",
     )
-    agent: AgentPayload = Field(
-        ...,
-        description="에이전트 메타 (intent·mode 등)",
+    intent: Literal["SMALL_TALK", "TECHNICAL"] | None = Field(
+        default=None,
+        description="/ai/chat 질문 유형 판별 결과",
+    )
+    agent: AgentPayload | None = Field(
+        default=None,
+        description="(레거시) 에이전트 메타 (intent·mode 등)",
     )
