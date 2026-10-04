@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -51,7 +52,7 @@ class FakeLLM:
         system_prompt: str | None = None,
         timeout_seconds: int | None = None,
     ) -> str:
-        self.calls.append({"prompt": prompt, "system_prompt": system_prompt})
+        self.calls.append({"prompt": prompt, "system_prompt": system_prompt, "timeout_seconds": timeout_seconds})
         if self.error is not None:
             raise self.error
         return self.answer
@@ -210,6 +211,67 @@ def test_use_rag_true_small_talk_with_relevant_doc_uses_rag() -> None:
 
     assert result["source"] == "rag"
     assert result["ragUsed"] is True
+
+
+def _chat_answer_log(caplog: pytest.LogCaptureFixture) -> str:
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("chat_answer ")]
+    assert len(lines) == 1
+    return lines[0]
+
+
+def test_llm_failure_keeps_filtered_count_in_log(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="app.services.rag_chat_service")
+    retriever = FakeRetriever([_ref(0.7853, "Docker"), _ref(0.5012, "VM"), _ref(0.441, "Network")])
+
+    result, _, llm = _run(
+        "Docker 이미지와 컨테이너 차이가 뭐야?",
+        retriever=retriever,
+        llm=FakeLLM(error=RuntimeError("LLM 호출 타임아웃 (60s 초과)")),
+    )
+
+    assert "[1] Docker" in llm.calls[0]["prompt"]
+    assert result["source"] == "fallback"
+    assert result["references"] == []
+    log = _chat_answer_log(caplog)
+    assert "candidates=3 top_score=0.7853 kept=1 min_score=0.55 source=fallback" in log
+
+
+def test_rag_success_log_kept_matches_references(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="app.services.rag_chat_service")
+
+    result, _, _ = _run("Docker 이미지와 컨테이너 차이가 뭐야?", retriever=FakeRetriever([_ref(0.7853)]))
+
+    assert result["source"] == "rag"
+    assert len(result["references"]) == 1
+    assert "kept=1 min_score=0.55 source=rag" in _chat_answer_log(caplog)
+
+
+def test_llm_call_uses_settings_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "LLM_TIMEOUT_SECONDS", 60)
+    _, _, llm = _run("Docker 이미지와 컨테이너 차이가 뭐야?", retriever=FakeRetriever([_ref(0.7853)]))
+
+    assert llm.calls[0]["timeout_seconds"] == 60
+
+
+def test_llm_failure_log_includes_error_message_and_timeout(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "LLM_TIMEOUT_SECONDS", 60)
+    caplog.set_level(logging.WARNING, logger="app.services.rag_chat_service")
+    question = "Docker 이미지와 컨테이너 차이가 뭐야?"
+
+    llm = FakeLLM(error=RuntimeError("LLM 호출 타임아웃 (60s 초과)"))
+    _run(question, retriever=FakeRetriever([_ref(0.7853)]), llm=llm)
+
+    warnings = [r.getMessage() for r in caplog.records if "chat LLM call failed" in r.getMessage()]
+    assert warnings == [
+        'chat LLM call failed, using fallback: errorType=RuntimeError error="LLM 호출 타임아웃 (60s 초과)" timeout=60'
+    ]
+    assert question not in warnings[0]
 
 
 def test_rag_synthesis_is_removed() -> None:

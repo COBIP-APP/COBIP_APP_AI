@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_CHUNK_CHARS = 700  # 모바일 컨텍스트 초과 방지
 _REFERENCE_CONTENT_MAX_CHARS = 300
-_LLM_TIMEOUT_SECONDS = 35
+_LOG_ERROR_MAX_CHARS = 300
 
 CHAT_FALLBACK_ANSWER = (
     "현재 답변을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."
@@ -136,6 +136,7 @@ class RagChatService:
         if rag_attempted:
             candidates = await self._retrieve(question)
             refs = _filter_relevant(candidates, settings.CHAT_RAG_MIN_SCORE)
+        filtered_count = len(refs)
 
         if refs:
             system_prompt = _RAG_SYSTEM_PROMPT
@@ -167,7 +168,7 @@ class RagChatService:
             rag_attempted,
             len(candidates),
             f"{max(scores):.4f}" if scores else None,
-            len(refs),
+            filtered_count,
             settings.CHAT_RAG_MIN_SCORE,
             source,
             len(question),
@@ -196,17 +197,20 @@ class RagChatService:
             return []
 
     async def _generate(self, prompt: str, system_prompt: str) -> str | None:
+        timeout = settings.LLM_TIMEOUT_SECONDS
         try:
             raw = await asyncio.to_thread(
                 self.llm.generate_text,
                 prompt=prompt,
                 system_prompt=system_prompt,
-                timeout_seconds=_LLM_TIMEOUT_SECONDS,
+                timeout_seconds=timeout,
             )
         except Exception as exc:
             logger.warning(
-                "chat LLM call failed, using fallback: errorType=%s",
+                'chat LLM call failed, using fallback: errorType=%s error="%s" timeout=%s',
                 type(exc).__name__,
+                str(exc)[:_LOG_ERROR_MAX_CHARS],
+                timeout,
             )
             return None
         if raw and raw.strip():
