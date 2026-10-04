@@ -18,6 +18,8 @@ __all__ = [
     "CodeIssueSchema",
     "QuizGradeRequest",
     "QuizGradeResponse",
+    "QuizGradeCriterion",
+    "QuizGradeCriterionResult",
     "MissionFeedbackRequest",
     "MissionFeedbackResponse",
     "CodeAnalyzeRequest",
@@ -51,6 +53,8 @@ class QuizGradeRequest(BaseModel):
     featureName: str
     question: QuestionSchema
     userAnswer: str
+    # 서술형 생성 결과의 채점 키워드. AI criteria 생성 시 참고 정보로만 사용한다.
+    gradingKeywords: list[str] | None = None
     relatedRequirements: list[RequirementSchema] | None = None
     relatedApiSpecs: list[ApiSpecSchema] | None = None
 
@@ -58,6 +62,22 @@ class QuizGradeRequest(BaseModel):
     @classmethod
     def _normalize_fe_payload(cls, data: Any) -> Any:
         return normalize_quiz_grade_payload(data)
+
+
+# AI 채점 내부 전용 모델 (외부 응답 QuizGradeResponse 에는 포함하지 않는다)
+class QuizGradeCriterion(BaseModel):
+    id: int
+    description: str
+    weight: int
+
+
+class QuizGradeCriterionResult(BaseModel):
+    id: int
+    description: str
+    weight: int
+    passed: bool
+    score: int
+    feedback: str = ""
 
 
 class QuizGradeResponse(BaseModel):

@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.models.enums import QuestionType
+from app.schemas.quiz import normalize_quiz_type
+
 __all__ = [
     "normalize_mission_feedback_payload",
     "normalize_quiz_grade_payload",
@@ -173,6 +176,78 @@ def normalize_mission_feedback_payload(data: object) -> dict[str, Any]:
     return out
 
 
+_QUESTION_TYPE_VALUES = frozenset(t.value for t in QuestionType)
+_GENERATED_TYPE_TO_GRADE_TYPE = {"blank": QuestionType.FILL_BLANK.value}
+_DIFFICULTY_ALIASES: dict[str, str] = {
+    "초급": "beginner",
+    "beginner": "beginner",
+    "easy": "beginner",
+    "중급": "intermediate",
+    "intermediate": "intermediate",
+    "medium": "intermediate",
+    "고급": "advanced",
+    "advanced": "advanced",
+    "hard": "advanced",
+}
+
+
+def _normalize_grade_question_type(value: object) -> object:
+    """생성 응답 유형(blank, 서술형, MULTIPLE_CHOICE 등)을 QuestionType 값으로 맞춘다."""
+    if not isinstance(value, str):
+        return value
+    key = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if key in _QUESTION_TYPE_VALUES:
+        return key
+    generated = normalize_quiz_type(value)
+    if generated is None:
+        return value
+    return _GENERATED_TYPE_TO_GRADE_TYPE.get(generated, generated)
+
+
+def _normalize_difficulty(value: object) -> str | None:
+    key = _coerce_str(value).lower()
+    return _DIFFICULTY_ALIASES.get(key)
+
+
+def _normalize_grading_keywords(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    keywords = [_coerce_str(v) for v in value if _coerce_str(v)]
+    return keywords or None
+
+
+def _normalize_generated_question_fields(q: dict[str, Any], out: dict[str, Any]) -> None:
+    """/ai/quiz/generate 의 QuizQuestionItem 형식을 QuestionSchema 형식으로 보정한다."""
+    if _coerce_str(q.get("questionId")):
+        q["questionId"] = _coerce_str(q.get("questionId"))
+    elif _coerce_str(q.get("id")):
+        q["questionId"] = _coerce_str(q.get("id"))
+    else:
+        q["questionId"] = "Q-1"
+    q.pop("id", None)
+
+    if "type" in q:
+        q["type"] = _normalize_grade_question_type(q.get("type"))
+
+    options = q.pop("options", None)
+    if q.get("choices") is None and isinstance(options, list):
+        q["choices"] = options
+
+    if q.get("explanation") is None:
+        q["explanation"] = ""
+
+    difficulty = _normalize_difficulty(q.get("difficulty"))
+    if difficulty is None:
+        difficulty = _normalize_difficulty(out.get("difficulty")) or "intermediate"
+    q["difficulty"] = difficulty
+
+    question_keywords = q.pop("gradingKeywords", None)
+    keywords = _normalize_grading_keywords(out.get("gradingKeywords"))
+    if keywords is None:
+        keywords = _normalize_grading_keywords(question_keywords)
+    out["gradingKeywords"] = keywords
+
+
 def normalize_quiz_grade_payload(data: object) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
@@ -192,7 +267,11 @@ def normalize_quiz_grade_payload(data: object) -> dict[str, Any]:
         if user is not None:
             out["userAnswer"] = _coerce_str(user)
         out.pop("answer", None)
+        _normalize_generated_question_fields(q, out)
         out["question"] = q
+
+    if not _coerce_str(out.get("featureName")):
+        out["featureName"] = _coerce_str(out.get("category"))
 
     related = out.get("relatedApiSpecs")
     if related is not None:

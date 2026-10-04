@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.main import app
 from app.models.enums import DifficultyLevel, QuestionType
 from app.schemas.evaluation import QuizGradeRequest
@@ -19,6 +21,12 @@ _RESPONSE_FIELDS = frozenset(
         "relatedSection",
     }
 )
+
+
+@pytest.fixture(autouse=True)
+def _rule_grading_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """이 파일은 기존 rule 채점 계약을 검증한다. AI 채점 경로는 test_quiz_grade_ai.py."""
+    monkeypatch.setattr(settings, "QUIZ_GRADE_AI_ENABLED", False)
 
 
 def _quiz_payload(**overrides: object) -> dict:

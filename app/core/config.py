@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     RAG_TOP_K: int = 3
     # /ai/chat 전용: 이 score 미만 검색 결과는 prompt/references 에서 제외
     CHAT_RAG_MIN_SCORE: float = 0.55
+    # /ai/quiz/grade: false 이면 AI 채점 없이 기존 rule 채점만 사용
+    QUIZ_GRADE_AI_ENABLED: bool = True
 
     # Agentic RAG 15차: 기능템플릿 전용 RAG 검색·프롬프트 방어 파라미터
     FEATURE_TEMPLATE_RAG_TOP_K: int = 3

@@ -5,13 +5,25 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Literal, TypeVar
 
+from app.core.config import settings
 from app.models.enums import QuestionType
+from app.prompts.quiz_grade_prompts import (
+    QUIZ_ANSWER_GRADING_SYSTEM_PROMPT,
+    QUIZ_CRITERIA_SYSTEM_PROMPT,
+    build_quiz_answer_grading_prompt,
+    build_quiz_criteria_prompt,
+)
 from app.schemas.evaluation import (
     CodeAnalyzeRequest,
     CodeAnalyzeResponse,
     JavaCodeGradingRequest,
     JavaCodeGradingResponse,
+    QuizGradeCriterion,
+    QuizGradeCriterionResult,
     QuizGradeRequest,
     QuizGradeResponse,
 )
@@ -31,6 +43,54 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+GradingMethod = Literal["rule", "ai", "rule_fallback"]
+GradeResult = Literal["CORRECT", "PARTIAL", "INCORRECT"]
+
+# 정규화 완전 일치가 아니면 AI criteria 채점을 시도하는 유형.
+# MULTIPLE_CHOICE / OX 는 항상 rule 채점.
+_AI_GRADED_TYPES: frozenset[QuestionType] = frozenset(
+    {
+        QuestionType.SHORT_ANSWER,
+        QuestionType.FILL_BLANK,
+        QuestionType.DESCRIPTIVE,
+        QuestionType.OUTPUT_PREDICTION,
+        QuestionType.CODE_ERROR_FIND,
+        QuestionType.CODE_FILL,
+    }
+)
+
+_MAX_CRITERIA = 5
+_CORRECT_MIN_SCORE = 80
+_PARTIAL_MIN_SCORE = 40
+_LLM_JSON_MAX_ATTEMPTS = 2
+_CRITERIA_MAX_TOKENS = 512
+_GRADING_MAX_TOKENS = 1024
+_LOG_ERROR_MAX_CHARS = 300
+_CRITERION_FEEDBACK_MAX_CHARS = 500
+_MIN_CRITERION_CHARS = 6
+_LLM_JSON_RETRY_SUFFIX = (
+    "\n\n[주의: 이전 응답이 규약에 맞지 않았습니다({error}). "
+    "설명 없이 규약의 JSON 객체 하나만 출력하라.]"
+)
+_VAGUE_CRITERION_RE = re.compile(r"잘\s*(이해|작성|설명|풀|답|했|하였)|적절(히|하게)\s*(작성|답|설명)했")
+
+
+
+@dataclass
+class _QuizGradeOutcome:
+    """grade_quiz 내부 결과. 외부 응답은 response(기존 6개 필드)만 반환한다."""
+
+    response: QuizGradeResponse
+    grading_method: GradingMethod
+    result: GradeResult | None = None
+    criteria_results: list[QuizGradeCriterionResult] = field(default_factory=list)
+
+
+_OX_TRUE = frozenset({"o", "○", "true", "t", "참", "맞다", "맞음", "예", "yes", "y"})
+_OX_FALSE = frozenset({"x", "×", "false", "f", "거짓", "틀리다", "틀림", "아니오", "no", "n"})
 
 
 # 개념 키워드별 한 문장 코칭 설명. normalize_answer_text 가 한글 동의어를
@@ -59,18 +119,71 @@ _KEYWORD_COACHING: dict[str, str] = {
 class EvaluationService:
     """기능템플릿 기본 문제 채점 + 코드 분석 service."""
 
+    def __init__(self, llm_service: LLMService | None = None) -> None:
+        self._llm = llm_service or LLMService()
+
     def grade_quiz(self, request: QuizGradeRequest) -> QuizGradeResponse:
+        """유형별 rule / AI criteria 혼합 채점. 응답은 기존 6개 필드만 반환한다.
+
+        - MULTIPLE_CHOICE / OX, 빈 답안, 정규화 완전 일치: rule
+        - 그 외 _AI_GRADED_TYPES: AI 2단계(criteria 생성 → 기준별 평가)
+        - AI 호출·파싱·검증 실패: 기존 _grade_answer 로 rule_fallback
+        """
+        return self._grade_quiz_outcome(request).response
+
+    def _grade_quiz_outcome(self, request: QuizGradeRequest) -> _QuizGradeOutcome:
         correct_answer = (request.question.answer or "").strip()
         user_answer = (request.userAnswer or "").strip()
         q_type = request.question.type
 
+        use_ai = (
+            bool(correct_answer)
+            and bool(user_answer)
+            and q_type in _AI_GRADED_TYPES
+            and not self._is_exact_match(correct_answer, user_answer, q_type)
+            and self._ai_grading_enabled()
+        )
+        if not use_ai:
+            return self._rule_quiz_response(
+                request,
+                correct_answer=correct_answer,
+                user_answer=user_answer,
+                grading_method="rule",
+            )
+
+        try:
+            ai_outcome = self._grade_quiz_with_ai(
+                request,
+                correct_answer=correct_answer,
+                user_answer=user_answer,
+            )
+        except Exception as exc:  # noqa: BLE001 - 어떤 실패든 rule 채점으로 응답한다.
+            self._log_ai_failure(stage="unexpected", q_type=q_type, exc=exc)
+            ai_outcome = None
+
+        if ai_outcome is not None:
+            return ai_outcome
+        return self._rule_quiz_response(
+            request,
+            correct_answer=correct_answer,
+            user_answer=user_answer,
+            grading_method="rule_fallback",
+        )
+
+    def _rule_quiz_response(
+        self,
+        request: QuizGradeRequest,
+        *,
+        correct_answer: str,
+        user_answer: str,
+        grading_method: GradingMethod,
+    ) -> _QuizGradeOutcome:
         is_correct, score = self._grade_answer(
             correct_answer=correct_answer,
             user_answer=user_answer,
-            question_type=q_type,
+            question_type=request.question.type,
             choices=request.question.choices,
         )
-
         feedback = self._build_quiz_feedback(
             is_correct=is_correct,
             score=score,
@@ -79,21 +192,360 @@ class EvaluationService:
             related_section=request.question.relatedSection,
             question_text=(request.question.question or "").strip(),
         )
-
-        return QuizGradeResponse(
+        logger.info(
+            "quiz_grade type=%s method=%s score=%d",
+            request.question.type.value,
+            grading_method,
+            score,
+        )
+        response = QuizGradeResponse(
             isCorrect=is_correct,
             score=score,
             feedback=feedback,
             correctAnswer=correct_answer,
-            explanation=(
-                request.question.explanation
-                or self._build_explanation_fallback(
-                    correct_answer=correct_answer,
-                    related_section=request.question.relatedSection,
-                    question_text=(request.question.question or "").strip(),
-                )
-            ),
+            explanation=self._quiz_explanation(request, correct_answer),
             relatedSection=request.question.relatedSection,
+        )
+        return _QuizGradeOutcome(response=response, grading_method=grading_method)
+
+    def _quiz_explanation(self, request: QuizGradeRequest, correct_answer: str) -> str:
+        return request.question.explanation or self._build_explanation_fallback(
+            correct_answer=correct_answer,
+            related_section=request.question.relatedSection,
+            question_text=(request.question.question or "").strip(),
+        )
+
+    @staticmethod
+    def _ai_grading_enabled() -> bool:
+        return bool(settings.QUIZ_GRADE_AI_ENABLED and settings.OLLAMA_BASE_URL)
+
+    @staticmethod
+    def _compact_answer(text: str) -> str:
+        return re.sub(r"\s+", "", normalize_answer_text(text))
+
+    @classmethod
+    def _is_exact_match(
+        cls,
+        correct_answer: str,
+        user_answer: str,
+        question_type: QuestionType,
+    ) -> bool:
+        """정규화(대소문자·공백·문장부호·동의어) 후 완전 일치 여부. 빈칸은 칸별 비교."""
+        if question_type == QuestionType.FILL_BLANK:
+            correct_parts = cls._split_blank_answers(correct_answer)
+            if len(correct_parts) > 1:
+                user_parts = cls._split_blank_answers(user_answer)
+                return len(user_parts) == len(correct_parts) and all(
+                    cls._compact_answer(c) == cls._compact_answer(u)
+                    for c, u in zip(correct_parts, user_parts, strict=True)
+                )
+        compact_correct = cls._compact_answer(correct_answer)
+        return bool(compact_correct) and compact_correct == cls._compact_answer(user_answer)
+
+    @staticmethod
+    def _split_blank_answers(text: str) -> list[str]:
+        return [part for part in re.split(r"\s*[,，]\s*", text.strip()) if part]
+
+    # ------------------------------------------------------------------
+    # AI criteria 채점
+    # ------------------------------------------------------------------
+    def _grade_quiz_with_ai(
+        self,
+        request: QuizGradeRequest,
+        *,
+        correct_answer: str,
+        user_answer: str,
+    ) -> _QuizGradeOutcome | None:
+        question = request.question
+        q_type = question.type
+        question_text = (question.question or "").strip()
+
+        try:
+            criteria = self._generate_criteria(
+                question_type=q_type,
+                question_text=question_text,
+                correct_answer=correct_answer,
+                explanation=question.explanation,
+                choices=question.choices,
+                grading_keywords=request.gradingKeywords,
+            )
+        except (RuntimeError, ValueError) as exc:
+            self._log_ai_failure(stage="criteria", q_type=q_type, exc=exc)
+            return None
+
+        try:
+            criteria_results, total_score, ai_feedback = self._grade_with_criteria(
+                question_type=q_type,
+                question_text=question_text,
+                correct_answer=correct_answer,
+                criteria=criteria,
+                user_answer=user_answer,
+            )
+        except (RuntimeError, ValueError) as exc:
+            self._log_ai_failure(stage="grade", q_type=q_type, exc=exc)
+            return None
+
+        result = self._result_from_score(total_score)
+        is_correct = result == "CORRECT"
+        feedback = ai_feedback or self._build_quiz_feedback(
+            is_correct=is_correct,
+            score=total_score,
+            correct_answer=correct_answer,
+            user_answer=user_answer,
+            related_section=question.relatedSection,
+            question_text=question_text,
+        )
+        logger.info(
+            "quiz_grade type=%s method=ai criteria=%d score=%d result=%s",
+            q_type.value,
+            len(criteria),
+            total_score,
+            result,
+        )
+        response = QuizGradeResponse(
+            isCorrect=is_correct,
+            score=total_score,
+            feedback=feedback,
+            correctAnswer=correct_answer,
+            explanation=self._quiz_explanation(request, correct_answer),
+            relatedSection=question.relatedSection,
+        )
+        return _QuizGradeOutcome(
+            response=response,
+            grading_method="ai",
+            result=result,
+            criteria_results=criteria_results,
+        )
+
+    def _generate_criteria(
+        self,
+        *,
+        question_type: QuestionType,
+        question_text: str,
+        correct_answer: str,
+        explanation: str | None,
+        choices: list[str] | None,
+        grading_keywords: list[str] | None,
+    ) -> list[QuizGradeCriterion]:
+        """1단계: 문제·모범답안으로 criteria 를 생성한다(학생 답안 미포함)."""
+        prompt = build_quiz_criteria_prompt(
+            question_type=question_type.value,
+            question=question_text,
+            correct_answer=correct_answer,
+            explanation=explanation,
+            choices=choices,
+            grading_keywords=grading_keywords,
+        )
+        return self._call_llm_json(
+            prompt=prompt,
+            system_prompt=QUIZ_CRITERIA_SYSTEM_PROMPT,
+            validator=self._validate_criteria,
+            max_tokens=_CRITERIA_MAX_TOKENS,
+        )
+
+    def _grade_with_criteria(
+        self,
+        *,
+        question_type: QuestionType,
+        question_text: str,
+        correct_answer: str,
+        criteria: list[QuizGradeCriterion],
+        user_answer: str,
+    ) -> tuple[list[QuizGradeCriterionResult], int, str]:
+        """2단계: criteria 별 충족 여부를 평가한다. totalScore 는 서버가 합산한다."""
+        prompt = build_quiz_answer_grading_prompt(
+            question_type=question_type.value,
+            question=question_text,
+            correct_answer=correct_answer,
+            criteria=[(c.id, c.description, c.weight) for c in criteria],
+            user_answer=user_answer,
+        )
+        return self._call_llm_json(
+            prompt=prompt,
+            system_prompt=QUIZ_ANSWER_GRADING_SYSTEM_PROMPT,
+            validator=lambda data: self._validate_grade_result(data, criteria),
+            max_tokens=_GRADING_MAX_TOKENS,
+        )
+
+    def _call_llm_json(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str,
+        validator: Callable[[dict], _T],
+        max_tokens: int,
+    ) -> _T:
+        """LLM 호출 → JSON 추출 → 검증.
+
+        RuntimeError(timeout·network·HTTP 등)는 재시도 없이 그대로 올린다.
+        JSON 파싱·스키마 오류(ValueError)만 최대 1회 재시도한다.
+        """
+        current_prompt = prompt
+        last_error: ValueError | None = None
+        for attempt in range(1, _LLM_JSON_MAX_ATTEMPTS + 1):
+            raw = self._llm.generate_text(
+                prompt=current_prompt,
+                system_prompt=system_prompt,
+                timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
+                max_tokens=max_tokens,
+            )
+            try:
+                data = self._extract_json_from_response(raw or "")
+                if not isinstance(data, dict) or not data:
+                    raise ValueError("LLM 응답에서 JSON 객체를 찾지 못했습니다")
+                return validator(data)
+            except ValueError as exc:
+                last_error = exc
+                logger.info(
+                    'quiz grade LLM JSON invalid attempt=%d error="%s"',
+                    attempt,
+                    str(exc)[:_LOG_ERROR_MAX_CHARS],
+                )
+                current_prompt = prompt + _LLM_JSON_RETRY_SUFFIX.format(
+                    error=str(exc)[:100]
+                )
+        assert last_error is not None
+        raise last_error
+
+    @classmethod
+    def _validate_criteria(cls, data: dict) -> list[QuizGradeCriterion]:
+        items = data.get("criteria")
+        if not isinstance(items, list):
+            raise ValueError("criteria 배열이 없습니다")  # noqa: TRY004 - 재시도 대상 스키마 오류
+
+        kept: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            description = _coerce_text(item.get("description"))
+            if not cls._is_meaningful_criterion(description):
+                continue
+            weight = _coerce_int(item.get("weight"))
+            if weight is None or weight <= 0:
+                continue
+            key = cls._compact_answer(description)
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append((description, weight))
+            if len(kept) == _MAX_CRITERIA:
+                break
+
+        if not kept:
+            raise ValueError("유효한 criteria가 없습니다")
+
+        weights = cls._normalize_weights([weight for _, weight in kept])
+        return [
+            QuizGradeCriterion(id=index, description=description, weight=weight)
+            for index, ((description, _), weight) in enumerate(
+                zip(kept, weights, strict=True), start=1
+            )
+        ]
+
+    @classmethod
+    def _is_meaningful_criterion(cls, description: str) -> bool:
+        if len(cls._compact_answer(description)) < _MIN_CRITERION_CHARS:
+            return False
+        return _VAGUE_CRITERION_RE.search(description) is None
+
+    @staticmethod
+    def _normalize_weights(weights: list[int]) -> list[int]:
+        """weight 합계를 100으로 보정한다(최대 잔여 방식, 각 항목 최소 1)."""
+        total = sum(weights)
+        if total == 100:
+            return list(weights)
+        logger.info("quiz grade criteria weights normalized original_sum=%d", total)
+        raw = [weight * 100 / total for weight in weights]
+        normalized = [int(value) for value in raw]
+        remainder = 100 - sum(normalized)
+        order = sorted(
+            range(len(raw)), key=lambda i: raw[i] - normalized[i], reverse=True
+        )
+        for index in order[:remainder]:
+            normalized[index] += 1
+        for index, weight in enumerate(normalized):
+            if weight == 0:
+                largest = max(range(len(normalized)), key=lambda i: normalized[i])
+                normalized[largest] -= 1
+                normalized[index] = 1
+        return normalized
+
+    @staticmethod
+    def _validate_grade_result(
+        data: dict,
+        criteria: list[QuizGradeCriterion],
+    ) -> tuple[list[QuizGradeCriterionResult], int, str]:
+        items = data.get("criteriaResults")
+        if not isinstance(items, list):
+            raise ValueError("criteriaResults 배열이 없습니다")  # noqa: TRY004 - 재시도 대상 스키마 오류
+
+        criteria_ids = {criterion.id for criterion in criteria}
+        by_id: dict[int, dict] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            criterion_id = _coerce_int(item.get("id"))
+            if criterion_id in criteria_ids and criterion_id not in by_id:
+                by_id[criterion_id] = item
+        if not by_id:
+            raise ValueError("criteria와 일치하는 평가 결과가 없습니다")
+
+        results: list[QuizGradeCriterionResult] = []
+        for criterion in criteria:
+            item = by_id.get(criterion.id)
+            if item is None:
+                results.append(
+                    QuizGradeCriterionResult(
+                        id=criterion.id,
+                        description=criterion.description,
+                        weight=criterion.weight,
+                        passed=False,
+                        score=0,
+                        feedback="평가 결과가 누락되어 0점 처리했습니다.",
+                    )
+                )
+                continue
+            score = _coerce_int(item.get("score"))
+            if score is None:
+                score = criterion.weight if item.get("passed") is True else 0
+            score = max(0, min(criterion.weight, score))
+            results.append(
+                QuizGradeCriterionResult(
+                    id=criterion.id,
+                    description=criterion.description,
+                    weight=criterion.weight,
+                    passed=score >= criterion.weight,
+                    score=score,
+                    feedback=_coerce_text(item.get("feedback"))[:_CRITERION_FEEDBACK_MAX_CHARS],
+                )
+            )
+
+        total_score = sum(result.score for result in results)
+        llm_total = _coerce_int(data.get("totalScore"))
+        if llm_total is not None and llm_total != total_score:
+            logger.info(
+                "quiz grade LLM totalScore ignored llm=%d server=%d", llm_total, total_score
+            )
+        return results, total_score, _coerce_text(data.get("feedback"))
+
+    @staticmethod
+    def _result_from_score(score: int) -> GradeResult:
+        if score >= _CORRECT_MIN_SCORE:
+            return "CORRECT"
+        if score >= _PARTIAL_MIN_SCORE:
+            return "PARTIAL"
+        return "INCORRECT"
+
+    @staticmethod
+    def _log_ai_failure(*, stage: str, q_type: QuestionType, exc: BaseException) -> None:
+        logger.warning(
+            'quiz grade AI failed, using rule fallback: stage=%s type=%s errorType=%s error="%s" timeout=%s',
+            stage,
+            q_type.value,
+            type(exc).__name__,
+            str(exc)[:_LOG_ERROR_MAX_CHARS],
+            settings.LLM_TIMEOUT_SECONDS,
         )
 
     @staticmethod
@@ -304,6 +756,9 @@ class EvaluationService:
         if norm_correct == norm_user:
             return True, 100
 
+        if question_type == QuestionType.OX:
+            return self._grade_ox(correct_answer, user_answer, choices)
+
         if question_type == QuestionType.MULTIPLE_CHOICE and choices:
             return self._grade_multiple_choice(
                 correct_answer, user_answer, choices, norm_correct, norm_user
@@ -350,6 +805,36 @@ class EvaluationService:
         if norm_user == norm_correct:
             return True, 100
         return False, 0
+
+    @classmethod
+    def _grade_ox(
+        cls,
+        correct_answer: str,
+        user_answer: str,
+        choices: list[str] | None,
+    ) -> tuple[bool, int]:
+        correct = cls._ox_value(correct_answer, choices)
+        user = cls._ox_value(user_answer, choices)
+        if correct is None or user is None:
+            return False, 0
+        return (True, 100) if correct == user else (False, 0)
+
+    @staticmethod
+    def _ox_value(text: str, choices: list[str] | None) -> str | None:
+        """O/X 답안을 'O' 또는 'X'로 정규화한다. 보기 번호('1', '2번')는 choices 로 해석한다."""
+        value = (text or "").strip()
+        number = re.fullmatch(r"(\d+)\s*(?:번|\.)?", value)
+        if number and choices:
+            index = int(number.group(1)) - 1
+            if 0 <= index < len(choices):
+                value = choices[index]
+        value = re.sub(r"^\s*\d+\s*(?:[.)]|번)\s*", "", value)
+        value = value.strip().rstrip(".!").strip().lower()
+        if value in _OX_TRUE:
+            return "O"
+        if value in _OX_FALSE:
+            return "X"
+        return None
 
     @staticmethod
     def _grade_short_answer(
@@ -511,3 +996,18 @@ class EvaluationService:
             feedback=feedback,
             formatted_code=request.code,
         )
+
+
+def _coerce_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _coerce_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return round(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
