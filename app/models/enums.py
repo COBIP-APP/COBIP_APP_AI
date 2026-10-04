@@ -14,6 +14,8 @@ class QuestionType(StrEnum):
     OUTPUT_PREDICTION = "output_prediction"
     CODE_ERROR_FIND = "code_error_find"
     CODE_FILL = "code_fill"
+    OX = "ox"
+    DESCRIPTIVE = "descriptive"
 
 
 class FeatureTemplateSection(StrEnum):
