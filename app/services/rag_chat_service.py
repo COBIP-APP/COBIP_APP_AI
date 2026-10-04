@@ -1,41 +1,75 @@
-"""실무 RAG 챗봇 서비스.
+"""실무 RAG 챗봇 서비스 (/ai/chat).
 
-페르소나: 10년 경력 시니어 백엔드 개발자 멘토
-- Qdrant Top-3 검색 후 지식 청크 주입
-- 모바일 친화 마크다운: **핵심 키워드** 볼드, 3문장 이내 요약, 코드 예시 1개
-- Ollama 오프라인 시 → RAG 청크 직접 합성 Fallback
+흐름:
+- classify_chat_intent + useRag 로 RAG 시도 여부 결정
+  (useRag=False → 미사용, True → 항상 시도, None → TECHNICAL 일 때만 시도)
+- 검색 결과는 CHAT_RAG_MIN_SCORE 이상만 prompt/references 에 사용
+- 관련 문서가 없으면 일반 LLM, LLM 실패/빈 응답이면 고정 fallback 문구
+
+응답 source: "rag"(RAG+LLM) / "ollama"(일반 LLM) / "fallback"(LLM 실패)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import re
 from typing import Any
 
+from app.core.config import settings
 from app.schemas.chat import ChatRequest
+from app.services.chat_query_policy import (
+    CHAT_INTENT_SMALL_TALK,
+    ChatIntent,
+    classify_chat_intent,
+)
 from app.services.llm_service import LLMService
 from app.services.retriever_service import RetrieverService
 
-__all__ = ["RagChatService"]
+__all__ = ["CHAT_FALLBACK_ANSWER", "RagChatService"]
 
 logger = logging.getLogger(__name__)
 
-_TOP_K = 3
 _MAX_CHUNK_CHARS = 700  # 모바일 컨텍스트 초과 방지
+_REFERENCE_CONTENT_MAX_CHARS = 300
+_LLM_TIMEOUT_SECONDS = 35
 
-_SYSTEM_PROMPT = """\
-너는 10년 경력 시니어 백엔드 개발자 멘토다.
-아래 [참고 지식(Context)] 청크를 바탕으로 질문에 답한다.
+CHAT_FALLBACK_ANSWER = (
+    "현재 답변을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."
+)
 
+_SMALL_TALK_SYSTEM_PROMPT = """\
+너는 COBIP 개발 학습 앱의 친근한 챗봇 도우미다.
+사용자의 인사, 감사, 가벼운 잡담에 답한다.
+
+### 응답 규칙
+1. 한국어로 1~2문장 이내로 짧고 친근하게 답한다.
+2. 질문받지 않은 기술 개념이나 문서 내용을 임의로 꺼내지 않는다.
+3. 무엇을 할 수 있는지 물으면 프로그래밍, 백엔드, 네트워크, 데이터베이스, 인프라 등
+   개발 개념 질문에 답하고 학습을 도울 수 있다고 간단히 소개한다.
+"""
+
+_MENTOR_RULES = """\
 ### 응답 규칙 (반드시 준수)
 1. **핵심 키워드를 볼드(`**키워드**`)**로 강조한다.
 2. 요약은 **3문장 이내**로 압축한다.
 3. 코드나 명령어가 필요하면 **1개의 코드 블록만** 포함한다.
 4. 일반론(\"아키텍처 이해가 필요합니다\" 류)으로 얼버무리지 않는다.
-5. [참고 지식(Context)]에 있는 내용을 **직접 인용·요약**하여 답한다.
-6. 한국어로 답하며, 모바일 화면에 맞게 간결하게 작성한다.
-7. 컨텍스트가 없을 경우에는 일반 지식으로 위 규칙을 지키며 답한다.
+5. 한국어로 답하며, 모바일 화면에 맞게 간결하게 작성한다.
 """
+
+_GENERAL_SYSTEM_PROMPT = (
+    "너는 10년 경력 시니어 백엔드 개발자 멘토다.\n"
+    "일반 개발 지식을 바탕으로 질문에 정확하게 답한다. "
+    "확실하지 않은 내용은 추측하지 말고 모른다고 말한다.\n\n" + _MENTOR_RULES
+)
+
+_RAG_SYSTEM_PROMPT = (
+    "너는 10년 경력 시니어 백엔드 개발자 멘토다.\n"
+    "아래 [참고 지식(Context)]은 질문과 관련 있을 수 있는 검색 결과다.\n"
+    "- Context가 질문과 관련 있으면 그 내용을 직접 인용·요약하여 답한다.\n"
+    "- 검색 Context가 질문과 관련 없으면 억지로 사용하지 말고, "
+    "일반 개발 지식으로 답한다.\n\n" + _MENTOR_RULES
+)
 
 
 def _build_context_block(refs: list[Any]) -> str:
@@ -51,100 +85,131 @@ def _build_context_block(refs: list[Any]) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-def _rag_synthesis_answer(question: str, refs: list[Any]) -> str:
-    """Ollama 없이 Qdrant 청크를 직접 합성하여 답변 생성."""
-    if not refs:
-        return (
-            f"**{question}**에 대한 관련 지식을 찾지 못했습니다.\n"
-            "더 구체적인 키워드로 다시 질문해 주세요."
-        )
+def _should_attempt_rag(intent: ChatIntent, use_rag: bool | None) -> bool:
+    if use_rag is False:
+        return False
+    if use_rag is True:
+        return True
+    return intent != CHAT_INTENT_SMALL_TALK
 
-    sorted_refs = sorted(refs, key=lambda r: getattr(r, "score", 0.0) or 0.0, reverse=True)
-    top = sorted_refs[0]
-    top_content = (top.content or "").strip()
-    top_title = (top.title or "").strip()
 
-    # 문장 단위 분리 (한국어·영어 혼용)
-    sentences = [
-        s.strip()
-        for s in re.split(r"(?<=[.。!?\n])\s*", top_content)
-        if len(s.strip()) > 15
-    ]
-    key_sentences = sentences[:3] if sentences else [top_content[:400]]
+def _filter_relevant(refs: list[Any], min_score: float) -> list[Any]:
+    """빈 content·score None·min_score 미만 결과를 제외한다."""
+    kept: list[Any] = []
+    for ref in refs:
+        if not (getattr(ref, "content", "") or "").strip():
+            continue
+        score = getattr(ref, "score", None)
+        if score is None or score < min_score:
+            continue
+        kept.append(ref)
+    return kept
 
-    # 추가 청크에서 보충 문장 수집
-    extra: list[str] = []
-    for ref in sorted_refs[1:]:
-        c = (ref.content or "").strip()
-        sents = [s.strip() for s in re.split(r"(?<=[.。!?\n])\s*", c) if len(s.strip()) > 15]
-        if sents:
-            extra.append(sents[0])
 
-    answer_parts = [f"**[{top_title} 기반 답변]**\n"]
-    answer_parts.extend(key_sentences)
-    if extra:
-        answer_parts.append("")
-        answer_parts.append("📌 추가 참고:")
-        answer_parts.extend(f"- {e[:150]}" for e in extra[:2])
-
-    return "\n".join(answer_parts)
+def _reference_payload(ref: Any) -> dict[str, Any]:
+    return {
+        "title": getattr(ref, "title", None),
+        "content": (getattr(ref, "content", "") or "")[:_REFERENCE_CONTENT_MAX_CHARS],
+        "score": getattr(ref, "score", None),
+        "sourceType": getattr(ref, "sourceType", None),
+    }
 
 
 class RagChatService:
-    """Qdrant Top-3 검색 + 시니어 개발자 페르소나 RAG 챗봇."""
+    """intent·similarity threshold 기반 RAG 라우팅 챗봇."""
 
-    def __init__(self) -> None:
-        self.llm = LLMService()
-        self.retriever = RetrieverService()
+    def __init__(
+        self,
+        llm: LLMService | None = None,
+        retriever: RetrieverService | None = None,
+    ) -> None:
+        self.llm = llm or LLMService()
+        self.retriever = retriever or RetrieverService()
 
     async def answer(self, request: ChatRequest) -> dict[str, Any]:
         question = request.message.strip()
+        intent = classify_chat_intent(question)
+        rag_attempted = _should_attempt_rag(intent, request.useRag)
 
-        # 1) Qdrant 검색
+        candidates: list[Any] = []
         refs: list[Any] = []
-        try:
-            refs = self.retriever.retrieve(question, top_k=_TOP_K)
-            refs = [r for r in refs if (r.content or "").strip()]
-        except Exception as exc:
-            logger.warning("RAG retrieval failed: %s", exc)
+        if rag_attempted:
+            candidates = await self._retrieve(question)
+            refs = _filter_relevant(candidates, settings.CHAT_RAG_MIN_SCORE)
 
-        # 2) 프롬프트 조립
-        context_block = _build_context_block(refs)
-        user_prompt = (
-            f"{context_block}\n\n" if context_block else ""
-        ) + f"[질문]: {question}"
+        if refs:
+            system_prompt = _RAG_SYSTEM_PROMPT
+            user_prompt = f"{_build_context_block(refs)}\n\n[질문]: {question}"
+        elif intent == CHAT_INTENT_SMALL_TALK:
+            system_prompt = _SMALL_TALK_SYSTEM_PROMPT
+            user_prompt = question
+        else:
+            system_prompt = _GENERAL_SYSTEM_PROMPT
+            user_prompt = f"[질문]: {question}"
 
-        # 3) LLM 호출
-        answer_text: str | None = None
-        source = "fallback"
-        try:
-            raw = self.llm.generate_text(
-                prompt=user_prompt,
-                system_prompt=_SYSTEM_PROMPT,
-                timeout_seconds=35,
-            )
-            if raw and raw.strip():
-                answer_text = raw.strip()
-                source = "ollama"
-        except Exception as exc:
-            logger.warning("LLM call failed, using RAG synthesis fallback: %s", exc)
+        answer_text = await self._generate(user_prompt, system_prompt)
 
-        # 4) LLM 실패 시 → RAG 청크 직접 합성
-        if not answer_text:
-            answer_text = _rag_synthesis_answer(question, refs)
-            source = "rag_synthesis" if refs else "fallback"
+        if answer_text is None:
+            source = "fallback"
+            answer_text = CHAT_FALLBACK_ANSWER
+            refs = []
+        elif refs:
+            source = "rag"
+        else:
+            source = "ollama"
+
+        scores = [r.score for r in candidates if getattr(r, "score", None) is not None]
+        logger.info(
+            "chat_answer intent=%s use_rag=%s rag_attempted=%s candidates=%s "
+            "top_score=%s kept=%s min_score=%s source=%s query_len=%s",
+            intent,
+            request.useRag,
+            rag_attempted,
+            len(candidates),
+            f"{max(scores):.4f}" if scores else None,
+            len(refs),
+            settings.CHAT_RAG_MIN_SCORE,
+            source,
+            len(question),
+        )
 
         return {
             "answer": answer_text,
             "source": source,
-            "ragUsed": bool(refs),
-            "references": [
-                {
-                    "title": getattr(r, "title", None),
-                    "content": (getattr(r, "content", "") or "")[:300],
-                    "score": getattr(r, "score", None),
-                    "sourceType": getattr(r, "sourceType", None),
-                }
-                for r in refs
-            ],
+            "ragUsed": source == "rag",
+            "references": [_reference_payload(r) for r in refs] if source == "rag" else [],
+            "intent": intent,
         }
+
+    async def _retrieve(self, question: str) -> list[Any]:
+        try:
+            return await asyncio.to_thread(
+                self.retriever.retrieve,
+                question,
+                top_k=settings.RAG_TOP_K,
+            )
+        except Exception as exc:
+            logger.warning(
+                "chat RAG retrieval failed, using general LLM: errorType=%s",
+                type(exc).__name__,
+            )
+            return []
+
+    async def _generate(self, prompt: str, system_prompt: str) -> str | None:
+        try:
+            raw = await asyncio.to_thread(
+                self.llm.generate_text,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                timeout_seconds=_LLM_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "chat LLM call failed, using fallback: errorType=%s",
+                type(exc).__name__,
+            )
+            return None
+        if raw and raw.strip():
+            return raw.strip()
+        logger.warning("chat LLM returned empty response, using fallback")
+        return None
