@@ -162,26 +162,44 @@ class InterviewFeedbackResponse(BaseModel):
 
 class JavaCodeGradingRequest(BaseModel):
     """자바 코딩테스트 채점 요청 스키마."""
-    
+
     code: str = Field(..., description="채점할 자바 코드")
+    question: str | None = Field(
+        default=None,
+        description="코딩테스트 문제. criteria 미제공 시 이 텍스트로 평가 기준을 자동 생성한다."
+    )
     criteria: list[str] = Field(
         default_factory=list,
-        description="평가 기준 리스트 (예: 정수형 변수 선언, 조건문 사용, 반복문 사용 등)"
+        description="평가 기준 리스트 (예: 정수형 변수 선언, 조건문 사용 등). "
+                    "비어 있으면 question 기반으로 자동 생성한다."
     )
-    
+
     @field_validator("code")
     @classmethod
     def validate_code(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("code는 비어 있을 수 없습니다.")
         return v.strip()
-    
-    @field_validator("criteria")
+
+    @field_validator("question")
     @classmethod
-    def validate_criteria(cls, v: list[str]) -> list[str]:
-        if not v:
-            raise ValueError("criteria는 최소 1개 이상의 평가 기준이 필요합니다.")
-        return [item.strip() for item in v if item and item.strip()]
+    def normalize_question(cls, v: str | None) -> str | None:
+        return (v or "").strip() or None
+
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def normalize_criteria(cls, v: Any) -> Any:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [item.strip() for item in v if isinstance(item, str) and item.strip()]
+        return v
+
+    @model_validator(mode="after")
+    def require_question_or_criteria(self) -> "JavaCodeGradingRequest":
+        if not self.criteria and not self.question:
+            raise ValueError("criteria가 비어 있으면 question이 필요합니다.")
+        return self
 
 
 class JavaCodeGradingResponse(BaseModel):
