@@ -1619,42 +1619,190 @@ JSON 객체 하나만 출력:
     def grade_java_code(self, request: JavaCodeGradingRequest) -> JavaCodeGradingResponse:
         """LLM 기반 자바 코드 정적 분석 및 채점.
 
-        평가 기준(criteria)에 따라 자바 코드를 분석하고 점수를 부여한다.
+        criteria 가 요청에 없으면 question 에서 자동 생성한 뒤
+        기존 criteria 채점 프롬프트로 점수를 부여한다.
+        LLM 호출: criteria 요청 제공 시 1회(채점), 미제공 시 2회(생성 + 채점).
         """
         from app.prompts.code_analyze_prompts import build_java_code_grading_prompt
 
-        llm = LLMService()
-        
+        criteria = self._resolve_java_grading_criteria(request)
+
         # 프롬프트 구성
         prompt = build_java_code_grading_prompt(
             code=request.code,
-            criteria=request.criteria,
+            criteria=criteria,
         )
-        
+
         try:
             # LLM 호출
-            system_prompt = "너는 자바 코딩테스트 채점 전문가다."
-            raw_response = llm.generate_text(
+            raw_response = self._llm.generate_text(
                 prompt=prompt,
-                system_prompt=system_prompt,
-                timeout_seconds=60,
+                system_prompt=_JAVA_GRADING_LLM_SYSTEM,
+                timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
+                max_tokens=_JAVA_GRADING_MAX_TOKENS,
+                temperature=0.0,
             )
-            
-            # JSON 파싱
-            parsed = self._extract_json_from_response(raw_response)
-            
-            # 응답 객체 생성
-            return JavaCodeGradingResponse(
-                is_correct=parsed.get("is_correct", False),
-                score=self._validate_score(parsed.get("score", 0)),
-                feedback=parsed.get("feedback", "채점 피드백을 생성할 수 없었습니다."),
-                formatted_code=parsed.get("formatted_code", request.code),
+            response = self._build_java_grading_response(
+                _parse_java_llm_json(raw_response or ""), criteria, request
             )
-            
-        except Exception as exc:
-            logger.error("Java code grading failed: %s", exc)
+            method = "llm"
+        except Exception as exc:  # noqa: BLE001 - 어떤 실패든 규칙 fallback 응답으로 돌린다.
+            logger.warning(
+                'java_code_grade grading failed, using rule fallback errorType=%s error="%s"',
+                type(exc).__name__,
+                str(exc)[:_LOG_ERROR_MAX_CHARS],
+            )
             # 실패 시 fallback 응답
-            return self._generate_fallback_grading_response(request)
+            response = self._generate_fallback_grading_response(request, criteria)
+            method = "rule_fallback"
+
+        logger.info(
+            "java_code_grade method=%s criteria=%d score=%d is_correct=%s",
+            method,
+            len(criteria),
+            response.score,
+            response.is_correct,
+        )
+        return response
+
+    def _build_java_grading_response(
+        self,
+        parsed: dict,
+        criteria: list[str],
+        request: JavaCodeGradingRequest,
+    ) -> JavaCodeGradingResponse:
+        """LLM 채점 결과를 서버 규칙으로 보수적으로 재계산한다.
+
+        - criteria_results 가 있으면 기준별 passed 로 점수를 서버가 계산한다.
+        - 코드에서 근거(출력 문자열·변수명·if/for 등)가 확인되지 않는 기준은 passed 여도 미충족 처리한다.
+        - criteria_results 가 없으면 LLM score 를 근거 상한으로 제한한다.
+        - is_correct 는 score == 100 과 항상 일치시킨다.
+        """
+        total = len(criteria)
+        evidence = [
+            _java_criterion_evidence(criterion, request.code, request.question)
+            for criterion in criteria
+        ]
+        results = _parse_java_criteria_results(parsed.get("criteria_results"), total)
+
+        if results is None:
+            if "score" not in parsed:
+                raise ValueError("채점 응답에 criteria_results / score 가 없습니다")
+            evidence_cap = round(100 * sum(ev is not False for ev in evidence) / total)
+            score = min(self._validate_score(parsed.get("score")), evidence_cap)
+            if _coerce_java_bool(parsed.get("is_correct")) is not True:
+                # LLM 이 '전부 충족'이라고 하지 않았다면 최소 1개 기준은 미충족으로 본다.
+                score = min(score, round(100 * (total - 1) / total))
+            met: list[str] = []
+            unmet = [
+                (criterion, _JAVA_NO_EVIDENCE_REASON)
+                for criterion, ev in zip(criteria, evidence, strict=True)
+                if ev is False
+            ]
+        else:
+            met, unmet = [], []
+            for criterion, (passed, reason), ev in zip(criteria, results, evidence, strict=True):
+                if passed and ev is False:
+                    unmet.append((criterion, _JAVA_NO_EVIDENCE_REASON))
+                elif passed:
+                    met.append(criterion)
+                else:
+                    unmet.append((criterion, reason))
+            score = round(100 * len(met) / total)
+
+        score = max(0, min(100, score))
+        is_correct = score == 100
+        if results is None:
+            summary = f"평가 기준 {total}개 기준 채점 결과 {score}점입니다."
+        else:
+            summary = f"평가 기준 {total}개 중 {len(met)}개를 충족했습니다. ({score}점)"
+
+        return JavaCodeGradingResponse(
+            is_correct=is_correct,
+            score=score,
+            feedback=_build_java_feedback(
+                summary=summary,
+                llm_feedback=_coerce_text(parsed.get("feedback")),
+                met=met,
+                unmet=unmet,
+            ),
+            formatted_code=_coerce_text(parsed.get("formatted_code")) or request.code,
+        )
+
+    def _resolve_java_grading_criteria(self, request: JavaCodeGradingRequest) -> list[str]:
+        """criteria 결정 순서: 요청값 > LLM(question) > 규칙 fallback(question)."""
+        if request.criteria:
+            logger.info(
+                "java_code_grade criteria_source=request count=%d",
+                len(request.criteria),
+            )
+            return request.criteria
+
+        question = (request.question or "").strip()
+        try:
+            criteria = self._generate_java_criteria(question)
+        except Exception as exc:  # noqa: BLE001 - timeout/파싱 포함 모든 실패는 fallback.
+            logger.warning(
+                'java_code_grade criteria generation failed errorType=%s error="%s"',
+                type(exc).__name__,
+                str(exc)[:_LOG_ERROR_MAX_CHARS],
+            )
+            criteria = []
+        if criteria:
+            logger.info(
+                "java_code_grade criteria_source=llm count=%d",
+                len(criteria),
+            )
+            return criteria
+
+        fallback = self._fallback_java_criteria(question)
+        logger.info(
+            "java_code_grade criteria_source=fallback count=%d",
+            len(fallback),
+        )
+        return fallback
+
+    def _generate_java_criteria(self, question: str) -> list[str]:
+        """question → LLM criteria 생성 (1회 호출, 재시도 없음). 실패 시 예외를 올려 호출부가 fallback 한다."""
+        from app.prompts.code_analyze_prompts import build_java_criteria_prompt
+
+        raw = self._llm.generate_text(
+            prompt=build_java_criteria_prompt(question=question),
+            system_prompt=_JAVA_CRITERIA_LLM_SYSTEM,
+            timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
+            max_tokens=_JAVA_CRITERIA_MAX_TOKENS,
+            temperature=0.0,
+        )
+        return self._validate_java_criteria(_parse_java_llm_json(raw or ""), question)
+
+    @staticmethod
+    def _validate_java_criteria(data: dict, question: str) -> list[str]:
+        """LLM criteria 검증: 빈/짧은/추상/중복/문제에 없는 요구사항 제거, 최대 5개."""
+        if not isinstance(data, dict) or "criteria" not in data:
+            raise ValueError("criteria key가 없습니다")
+        items = data["criteria"]
+        if not isinstance(items, list):
+            raise ValueError("criteria가 배열이 아닙니다")  # noqa: TRY004 - fallback 대상 스키마 오류
+
+        kept: list[str] = []
+        dropped: dict[str, int] = {}
+        for item in items:
+            text = _normalize_java_criterion(item)
+            reason = _java_criterion_reject_reason(text, question, kept)
+            if reason:
+                dropped[reason] = dropped.get(reason, 0) + 1
+                continue
+            kept.append(text)
+        if dropped:
+            logger.info("java_code_grade criteria_dropped %s", dropped)
+        if not kept:
+            raise ValueError("유효한 criteria가 없습니다")
+        return kept[:_JAVA_CRITERIA_MAX]
+
+    @staticmethod
+    def _fallback_java_criteria(question: str) -> list[str]:
+        """LLM 실패 시 question 에 실제로 등장한 요구사항만 규칙으로 추출한다."""
+        return _extract_java_fallback_criteria(question)
 
     def _extract_json_from_response(self, text: str) -> dict:
         """LLM 응답에서 JSON을 추출한다."""
@@ -1686,49 +1834,42 @@ JSON 객체 하나만 출력:
         except (ValueError, TypeError):
             return 0
 
-    def _generate_fallback_grading_response(self, request: JavaCodeGradingRequest) -> JavaCodeGradingResponse:
-        """LLM 실패 시 fallback 채점 응답을 생성한다."""
-        # 간단한 규칙 기반 채점
-        code_lower = request.code.lower()
-        
-        # 기본 점수
-        score = 0
-        feedback_parts = []
-        
-        # 정수형 변수 선언 확인
-        if any(keyword in code_lower for keyword in ["int ", "long ", "short ", "byte "]):
-            score += 25
-            feedback_parts.append("정수형 변수 선언이 확인되었습니다.")
-        else:
-            feedback_parts.append("정수형 변수 선언이 없습니다.")
-        
-        # 조건문 확인
-        if "if " in code_lower:
-            score += 25
-            feedback_parts.append("조건문(if)이 사용되었습니다.")
-        else:
-            feedback_parts.append("조건문(if)이 없습니다.")
-        
-        # 반복문 확인
-        if any(keyword in code_lower for keyword in ["for ", "while "]):
-            score += 25
-            feedback_parts.append("반복문(for/while)이 사용되었습니다.")
-        else:
-            feedback_parts.append("반복문(for/while)이 없습니다.")
-        
-        # 들여쓰기 기본 확인
-        if "\t" in request.code or "    " in request.code:
-            score += 25
-            feedback_parts.append("기본적인 들여쓰기가 확인되었습니다.")
-        else:
-            feedback_parts.append("들여쓰기가 부족합니다.")
-        
-        feedback = " ".join(feedback_parts)
-        
+    def _generate_fallback_grading_response(
+        self,
+        request: JavaCodeGradingRequest,
+        criteria: list[str],
+    ) -> JavaCodeGradingResponse:
+        """LLM 실패 시 결정된 criteria 기준 규칙 매칭으로 채점한다.
+
+        int/if/for/들여쓰기를 무조건 채점하지 않고 criteria 에 있는 요구사항만 검사한다.
+        코드에서 근거를 확인할 수 없는 기준은 충족으로 간주하지 않는다 (보수적 채점).
+        """
+        met: list[str] = []
+        unmet: list[tuple[str, str]] = []
+        for criterion in criteria:
+            evidence = _java_criterion_evidence(criterion, request.code, request.question)
+            if evidence is True:
+                met.append(criterion)
+            elif evidence is False:
+                unmet.append((criterion, _JAVA_NO_EVIDENCE_REASON))
+            else:
+                unmet.append((criterion, "규칙으로 확인할 수 없어 미충족 처리했습니다."))
+
+        total = len(criteria)
+        score = round(100 * len(met) / total) if total else 0
+
         return JavaCodeGradingResponse(
-            is_correct=score >= 75,
+            is_correct=total > 0 and score == 100,
             score=score,
-            feedback=feedback,
+            feedback=_build_java_feedback(
+                summary=(
+                    f"LLM 채점 실패로 규칙 기반 채점을 적용했습니다. "
+                    f"(평가 기준 {total}개 중 {len(met)}개 충족, {score}점)"
+                ),
+                llm_feedback="",
+                met=met,
+                unmet=unmet,
+            ),
             formatted_code=request.code,
         )
 
@@ -1746,3 +1887,515 @@ def _coerce_int(value: object) -> int | None:
         return round(float(value))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# /ai/java/grade 전용 헬퍼 (quiz grading 로직과 공유하지 않는다)
+# ---------------------------------------------------------------------------
+_JAVA_CRITERIA_MAX = 5
+_JAVA_CRITERIA_MAX_TOKENS = 256
+_JAVA_GRADING_MAX_TOKENS = 1024
+_JAVA_MIN_CRITERION_CHARS = 6
+_JAVA_DUPLICATE_SIMILARITY = 0.8
+_JAVA_FALLBACK_QUOTED_MAX = 3
+# 상세 규약은 user prompt(builder)에 있으므로 system 은 짧게 유지해 토큰 중복을 피한다.
+_JAVA_CRITERIA_LLM_SYSTEM = "너는 자바 코딩테스트 평가 기준 생성기다. 규약의 JSON 객체 하나만 출력한다."
+_JAVA_GRADING_LLM_SYSTEM = "너는 자바 코딩테스트 채점 전문가다. 규약의 JSON 객체 하나만 출력한다."
+_JAVA_NO_EVIDENCE_REASON = "코드에서 해당 요구사항의 근거를 찾지 못했습니다."
+
+_JAVA_QUOTED_RE = re.compile(r'"([^"]+)"|\'([^\']+)\'|“([^”]+)”|‘([^’]+)’')
+_JAVA_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_.])\d+(?:\.\d+)?(?![A-Za-z0-9_])")
+_JAVA_IDENT_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])")
+_JAVA_STRING_LITERAL_RE = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
+_JAVA_CODE_COMMENT_RE = re.compile(r'("(?:[^"\\\n]|\\.)*")|//[^\n]*|/\*.*?\*/', re.DOTALL)
+_JAVA_CODE_LIKE_RE = re.compile(r"[=<>(){};]")
+# "그렇지 않으면"(else)은 부정 기준이 아니다.
+_JAVA_NEGATION_RE = re.compile(r"(?<!그렇지 )않|없이|금지|말고")
+_JAVA_CRITERION_PREFIX_RE = re.compile(r"^\s*(?:\d+\s*[.)]|[-*•])\s*")
+_JAVA_CRITERION_ENDING_RE = re.compile(r"(?:했|하였|되었|됐|하)?(?:는가|는지|나|인가)$")
+_JAVA_STOP_IDENTIFIERS = frozenset(
+    {
+        "if", "else", "for", "while", "do", "switch", "case", "break", "continue",
+        "int", "long", "short", "byte", "double", "float", "boolean", "char", "string",
+        "system", "out", "println", "print", "printf", "scanner", "main", "args",
+        "public", "private", "protected", "static", "void", "class", "return", "new",
+        "true", "false", "null", "java", "array", "method", "and", "or", "not",
+    }
+)
+
+# (이름, 기준 문장 패턴, 문제 문장 허용 패턴, 코드 근거 패턴)
+# - 기준에 개념이 있는데 문제에 없으면 '문제에 없는 요구사항'으로 제거한다.
+# - 기준에 개념이 있으면 코드에서 해당 근거 패턴을 확인한다.
+_JAVA_CONCEPTS: tuple[tuple[str, re.Pattern[str], re.Pattern[str], re.Pattern[str]], ...] = (
+    (
+        "for",
+        re.compile(r"\bfor\b|for문", re.I),
+        re.compile(r"\bfor\b|for문|반복|부터.{0,20}까지", re.I),
+        re.compile(r"\bfor\s*\("),
+    ),
+    (
+        "while",
+        re.compile(r"\bwhile\b|while문", re.I),
+        re.compile(r"\bwhile\b|while문|반복|부터.{0,20}까지", re.I),
+        re.compile(r"\bwhile\s*\("),
+    ),
+    (
+        "loop",
+        re.compile(r"반복"),
+        re.compile(r"\bfor\b|for문|\bwhile\b|while문|반복|부터.{0,20}까지", re.I),
+        re.compile(r"\b(?:for|while)\s*\("),
+    ),
+    (
+        "if",
+        re.compile(r"\bif\b|if문|조건문", re.I),
+        re.compile(r"\bif\b|if문|조건|만약|면(?:\s|,|$)|인지|여부|짝수|홀수|비교", re.I),
+        re.compile(r"\bif\s*\("),
+    ),
+    (
+        "else",
+        re.compile(r"\belse\b|else문|그렇지\s*않|아니면|거짓", re.I),
+        re.compile(r"\belse\b|else문|그렇지\s*않|아니면|아니라면|거짓|아닐|불합격|외에는|나머지\s*경우", re.I),
+        re.compile(r"\belse\b"),
+    ),
+    (
+        "print",
+        re.compile(r"출력|print", re.I),
+        re.compile(r"출력|print|표시|보여", re.I),
+        re.compile(r"System\s*\.\s*out\s*\.\s*print"),
+    ),
+    (
+        "input",
+        re.compile(r"입력|scanner", re.I),
+        re.compile(r"입력|scanner", re.I),
+        re.compile(r"\bScanner\b"),
+    ),
+    (
+        "array",
+        re.compile(r"배열|array|\[\s*\]", re.I),
+        re.compile(r"배열|array|\[\s*\]", re.I),
+        re.compile(r"\[\s*\d*\s*\]"),
+    ),
+    (
+        "method",
+        re.compile(r"메서드|메소드|함수|method", re.I),
+        re.compile(r"메서드|메소드|함수|method", re.I),
+        re.compile(r"\b(?:static|public|private|protected)\b[^;{=]*\([^)]*\)\s*\{"),
+    ),
+    (
+        "int",
+        re.compile(r"정수형|int형|\bint\b", re.I),
+        re.compile(r"정수|int형|\bint\b|\blong\b", re.I),
+        re.compile(r"\b(?:int|long|short|byte)\b"),
+    ),
+    (
+        "double",
+        re.compile(r"실수|double|float", re.I),
+        re.compile(r"실수|double|float", re.I),
+        re.compile(r"\b(?:double|float)\b"),
+    ),
+    (
+        "add",
+        re.compile(r"덧셈|더하|더한|더해|합계|합을|\+"),
+        re.compile(r"덧셈|더하|더한|더해|합(?!격)|\+|plus", re.I),
+        re.compile(r"[^+]\+[^+=]|\+="),
+    ),
+    (
+        "sub",
+        re.compile(r"뺄셈|빼|뺀|차이"),
+        re.compile(r"뺄셈|빼|뺀|차이|-"),
+        re.compile(r"[^-]-[^-=>]|-="),
+    ),
+    (
+        "mul",
+        re.compile(r"곱"),
+        re.compile(r"곱|\*"),
+        re.compile(r"\*"),
+    ),
+    (
+        "div",
+        re.compile(r"나눗셈|나누|나눈|몫"),
+        re.compile(r"나눗셈|나누|나눈|몫|/"),
+        re.compile(r"/"),
+    ),
+    (
+        "mod",
+        re.compile(r"나머지|%|짝수|홀수|배수"),
+        re.compile(r"나머지|%|짝수|홀수|배수"),
+        re.compile(r"%"),
+    ),
+)
+
+# fallback criteria 추출 규칙 (question 에 실제 등장한 요구사항만 사용)
+_JAVA_ASSIGN_RE = re.compile(
+    r"(?:(?P<type>정수형|실수형|문자열|정수|실수)\s*(?:타입의?\s*)?)?(?:변수\s*)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:에는|에다|에)\s*(?:값\s*)?"
+    r"(?P<value>\d+(?:\.\d+)?|\"[^\"]*\"|'[^']*')\s*(?:을|를)?\s*(?:저장|대입|할당|넣|초기화|담)"
+)
+_JAVA_COMPARE_RE = re.compile(
+    r"(?P<num>\d+(?:\.\d+)?)\s*"
+    r"(?P<rel>보다\s*(?:크|큰|많|작|작은|적)|이상|이하|초과|미만|(?:과|와)\s*같)"
+)
+_JAVA_RANGE_RE = re.compile(r"(?P<a>\d+)\s*부터\s*(?P<b>\d+)\s*까지")
+_JAVA_EXPLICIT_IF_RE = re.compile(r"\bif\b|if문|조건문|만약", re.I)
+_JAVA_EXPLICIT_ELSE_RE = re.compile(r"\belse\b|else문|그렇지\s*않으면|아니면|아니라면", re.I)
+_JAVA_FOR_RE = re.compile(r"\bfor\b|for문", re.I)
+_JAVA_WHILE_RE = re.compile(r"\bwhile\b|while문", re.I)
+_JAVA_PRINT_RE = re.compile(r"출력|print", re.I)
+_JAVA_ARITHMETIC_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"더하|더한|더해|덧셈|합을|합계"), "덧셈(+)"),
+    (re.compile(r"뺄셈|빼|뺀"), "뺄셈(-)"),
+    (re.compile(r"곱하|곱한|곱해|곱셈"), "곱셈(*)"),
+    (re.compile(r"나누|나눈|나눗셈|몫"), "나눗셈(/)"),
+    (re.compile(r"나머지"), "나머지(%)"),
+)
+# 추출 실패 시 문제 문장을 요구사항 절로 나누기 위한 구분자.
+_JAVA_QUESTION_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:한\s*뒤|한\s*후|후에|그런\s*다음|그리고|다음으로|다음에|마지막으로|하고|하여|[,，.。;；])\s*"
+)
+_JAVA_IMPERATIVE_ENDING_RE = re.compile(
+    r"\s*(?:하세요|하시오|해\s*주세요|해주세요|하라|해야\s*합니다|해야\s*한다|합니다|한다)\.?\s*$"
+)
+
+
+def _parse_java_llm_json(text: str) -> dict:
+    """코드펜스·앞뒤 설명이 섞인 LLM 응답에서 첫 JSON 객체를 추출한다. 실패 시 ValueError."""
+    cleaned = re.sub(r"```(?:json)?\s*", "", text or "", flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "").strip()
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        parsed = None
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(cleaned):
+            if char != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(cleaned[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                parsed = candidate
+                break
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM 응답에서 JSON 객체를 찾지 못했습니다")
+    return parsed
+
+
+def _coerce_java_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    return None
+
+
+def _strip_java_quoted(text: str) -> str:
+    return _JAVA_QUOTED_RE.sub(" ", text)
+
+
+def _java_quoted_values(text: str) -> list[str]:
+    return [
+        next(group for group in match.groups() if group is not None).strip()
+        for match in _JAVA_QUOTED_RE.finditer(text)
+    ]
+
+
+def _java_identifiers(text: str) -> list[str]:
+    return [
+        ident
+        for ident in _JAVA_IDENT_RE.findall(text)
+        if ident.lower() not in _JAVA_STOP_IDENTIFIERS
+    ]
+
+
+def _java_has_identifier(ident: str, text: str) -> bool:
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(ident)}(?![A-Za-z0-9_])", text) is not None
+
+
+def _java_clues(criterion: str) -> tuple[list[str], list[str], list[str], list[re.Pattern[str]]]:
+    """기준 문장에서 코드로 확인 가능한 단서를 뽑는다.
+
+    반환: (출력 문자열, 숫자, 식별자, 코드 근거 패턴)
+    따옴표 안 내용은 출력 문자열로만 취급하고 숫자/식별자/개념 추출에서는 제외한다.
+    """
+    outputs: list[str] = []
+    identifiers: list[str] = []
+    for value in _java_quoted_values(criterion):
+        if not value or _JAVA_CODE_LIKE_RE.search(value):
+            continue
+        if _JAVA_IDENT_RE.fullmatch(value) and value.lower() not in _JAVA_STOP_IDENTIFIERS:
+            identifiers.append(value)
+        elif value.lower() not in _JAVA_STOP_IDENTIFIERS:
+            outputs.append(value)
+    bare = _strip_java_quoted(criterion)
+    identifiers += _java_identifiers(bare)
+    numbers = _JAVA_NUMBER_RE.findall(bare)
+    concepts = [code_re for _, crit_re, _, code_re in _JAVA_CONCEPTS if crit_re.search(bare)]
+    return outputs, numbers, list(dict.fromkeys(identifiers)), concepts
+
+
+def _java_code_views(code: str) -> tuple[str, list[str]]:
+    """(주석·문자열 리터럴 내용을 제거한 코드, 문자열 리터럴 목록)."""
+    without_comments = _JAVA_CODE_COMMENT_RE.sub(lambda m: m.group(1) or " ", code)
+    literals = [
+        literal.replace('\\"', '"') for literal in _JAVA_STRING_LITERAL_RE.findall(without_comments)
+    ]
+    return _JAVA_STRING_LITERAL_RE.sub('""', without_comments), literals
+
+
+def _java_number_in_code(number: str, code: str) -> bool:
+    candidates = {number}
+    if number.isdigit():
+        # 'score > 60' ↔ 'score >= 61', 'i <= 5' ↔ 'i < 6' 같은 동치 표현 허용.
+        value = int(number)
+        candidates |= {str(value - 1), str(value + 1)}
+    return any(
+        re.search(rf"(?<![A-Za-z0-9_.]){re.escape(c)}(?![A-Za-z0-9_])", code) for c in candidates
+    )
+
+
+def _java_criterion_evidence(criterion: str, code: str, question: str | None) -> bool | None:
+    """기준의 코드 근거 확인.
+
+    True: 확인 가능한 단서가 모두 코드에 있음 / False: 하나 이상 없음 / None: 확인할 단서 없음.
+    question 이 있으면 문제에 등장한 숫자·식별자·출력 문자열만 강제한다
+    (계산 결과값처럼 코드에 직접 나오지 않을 수 있는 값으로 감점하지 않기 위함).
+    """
+    if _JAVA_NEGATION_RE.search(criterion):
+        return None
+    q = (question or "").strip()
+    outputs, numbers, identifiers, concepts = _java_clues(criterion)
+    # 문제에 따옴표로 명시된 출력 문자열이 기준 문장에 따옴표 없이 등장해도 근거로 쓴다.
+    bare = _strip_java_quoted(criterion)
+    for value in _java_quoted_values(q):
+        if (
+            value
+            and value not in outputs
+            and not _JAVA_CODE_LIKE_RE.search(value)
+            and re.search(rf"(?<![가-힣A-Za-z0-9]){re.escape(value)}(?![A-Za-z0-9])", bare)
+        ):
+            outputs.append(value)
+    code_clean, literals = _java_code_views(code)
+
+    checks: list[bool] = []
+    for value in outputs:
+        if not q or value in q:
+            # '합격' 기준이 "불합격" 리터럴로 통과하지 않도록 단어 경계를 둔다.
+            pattern = re.compile(rf"(?<![가-힣A-Za-z0-9]){re.escape(value)}(?![가-힣A-Za-z0-9])")
+            checks.append(any(pattern.search(literal) for literal in literals))
+    if q:
+        question_numbers = set(_JAVA_NUMBER_RE.findall(q))
+        checks += [_java_number_in_code(n, code_clean) for n in numbers if n in question_numbers]
+    for ident in identifiers:
+        if not q or _java_has_identifier(ident, q):
+            checks.append(_java_has_identifier(ident, code_clean))
+    checks += [bool(code_re.search(code_clean)) for code_re in concepts]
+    return all(checks) if checks else None
+
+
+def _normalize_java_criterion(item: object) -> str:
+    if isinstance(item, dict):
+        item = next(
+            (item[key] for key in ("description", "criterion", "text", "content") if item.get(key)),
+            None,
+        )
+    if not isinstance(item, str):
+        return ""
+    text = _JAVA_CRITERION_PREFIX_RE.sub("", item)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _java_criterion_key(text: str) -> str:
+    compact = re.sub(r"[\s\"'“”‘’.,!?()]", "", text.lower())
+    return _JAVA_CRITERION_ENDING_RE.sub("", compact)
+
+
+def _java_is_duplicate(text: str, kept: list[str]) -> bool:
+    """같은 단서(출력 문자열·숫자·식별자)를 가지면서 문장이 거의 같으면 중복으로 본다."""
+    key = _java_criterion_key(text)
+    clues = _java_clues(text)[:3]
+    bigrams = {key[i : i + 2] for i in range(len(key) - 1)}
+    for other in kept:
+        other_key = _java_criterion_key(other)
+        if key == other_key:
+            return True
+        if _java_clues(other)[:3] != clues:
+            continue
+        other_bigrams = {other_key[i : i + 2] for i in range(len(other_key) - 1)}
+        union = bigrams | other_bigrams
+        if union and len(bigrams & other_bigrams) / len(union) >= _JAVA_DUPLICATE_SIMILARITY:
+            return True
+    return False
+
+
+def _java_criterion_reject_reason(text: str, question: str, kept: list[str]) -> str | None:
+    if not text:
+        return "empty"
+    if len(re.sub(r"\s+", "", text)) < _JAVA_MIN_CRITERION_CHARS:
+        return "too_short"
+    outputs, numbers, identifiers, concepts = _java_clues(text)
+    if not (outputs or numbers or identifiers or concepts):
+        # "올바르게 구현했는가" 처럼 코드에서 확인할 단서가 없는 추상 기준
+        return "vague"
+    bare = _strip_java_quoted(text)
+    for _, crit_re, question_re, _ in _JAVA_CONCEPTS:
+        if crit_re.search(bare) and not question_re.search(question):
+            return "not_in_question"
+    # 1글자 식별자(i, j 등 반복 변수)는 문제에 없어도 허용한다.
+    if any(len(ident) > 1 and not _java_has_identifier(ident, question) for ident in identifiers):
+        return "not_in_question"
+    if any(value not in question for value in outputs):
+        return "not_in_question"
+    if _java_is_duplicate(text, kept):
+        return "duplicate"
+    return None
+
+
+def _parse_java_criteria_results(value: object, total: int) -> list[tuple[bool, str]] | None:
+    """채점 응답의 criteria_results → 기준 순서대로 (passed, reason). 유효 항목이 없으면 None."""
+    if not isinstance(value, list) or not value or total <= 0:
+        return None
+    results: list[tuple[bool, str] | None] = [None] * total
+    for position, item in enumerate(value):
+        if isinstance(item, dict):
+            index = _coerce_int(item.get("index"))
+            slot = index - 1 if index is not None and 1 <= index <= total else position
+            passed = _coerce_java_bool(item.get("passed"))
+            reason = _coerce_text(item.get("reason"))
+        elif isinstance(item, bool):
+            slot, passed, reason = position, item, ""
+        else:
+            continue
+        if passed is None or not 0 <= slot < total or results[slot] is not None:
+            continue
+        results[slot] = (passed, reason)
+    if all(result is None for result in results):
+        return None
+    return [result or (False, "채점 결과가 누락되어 미충족 처리했습니다.") for result in results]
+
+
+def _build_java_feedback(
+    *,
+    summary: str,
+    llm_feedback: str,
+    met: list[str],
+    unmet: list[tuple[str, str]],
+) -> str:
+    blocks = [summary]
+    if llm_feedback:
+        blocks.append(llm_feedback)
+    if met:
+        blocks.append("[충족한 요구사항]\n" + "\n".join(f"- {c}" for c in met))
+    if unmet:
+        blocks.append(
+            "[부족한 요구사항]\n"
+            + "\n".join(f"- {c}" + (f" ({reason})" if reason else "") for c, reason in unmet)
+        )
+    return "\n\n".join(blocks)
+
+
+def _java_relation(rel: str) -> str:
+    rel = re.sub(r"\s+", "", rel)
+    if rel == "이상":
+        return ">="
+    if rel == "이하":
+        return "<="
+    if rel.endswith("같"):
+        return "=="
+    if rel == "초과" or rel[-1:] in {"크", "큰", "많"}:
+        return ">"
+    return "<"
+
+
+def _extract_java_fallback_criteria(question: str) -> list[str]:
+    """question 에서 명확히 추출 가능한 요구사항만 기준으로 만든다.
+
+    if/반복문/출력 기준은 문제 문장에 해당 요구가 있을 때만 생성한다.
+    추출이 전혀 안 되면 일반 하드코딩 기준 대신 문제 문장 절을 그대로 기준으로 쓴다.
+    """
+    q = (question or "").strip()
+    criteria: list[str] = []
+
+    def add(text: str) -> None:
+        if not _java_is_duplicate(text, criteria):
+            criteria.append(text)
+
+    # 1. 변수 저장
+    assigned: list[str] = []
+    for match in _JAVA_ASSIGN_RE.finditer(q):
+        type_word = {"정수": "정수형", "실수": "실수형"}.get(match["type"] or "", match["type"] or "")
+        value = match["value"]
+        if value[0] == "'":
+            value = f'"{value[1:-1]}"'
+        prefix = f"{type_word} 변수" if type_word else "변수"
+        add(f"{prefix} {match['name']}에 {value}을(를) 저장했는가")
+        assigned.append(match["name"])
+
+    def subject(before: str) -> str:
+        if assigned:
+            return assigned[0]
+        idents = _java_identifiers(before) or _java_identifiers(q)
+        return idents[-1] if idents else "값"
+
+    # 2. 조건 (if 는 문제에 명시된 경우에만 기준 문장에 넣는다)
+    explicit_if = _JAVA_EXPLICIT_IF_RE.search(q) is not None
+    if_prefix = "if문으로 " if explicit_if else ""
+    compare = _JAVA_COMPARE_RE.search(q)
+    parity = re.search(r"짝수|홀수", q)
+    if compare:
+        target = subject(q[: compare.start()])
+        add(f"{if_prefix}{target} {_java_relation(compare['rel'])} {compare['num']} 조건을 비교했는가")
+    if parity:
+        target = subject(q[: parity.start()])
+        add(f"{if_prefix}% 연산자로 {target}이(가) {parity.group()}인지 검사했는가")
+    if explicit_if and not (compare or parity):
+        add("if문으로 조건을 검사했는가")
+    if _JAVA_EXPLICIT_ELSE_RE.search(q):
+        add("else로 조건이 거짓인 경우를 처리했는가")
+
+    # 3. 반복 (for/while/반복 이 문제에 있을 때만)
+    loop_word = (
+        "for문" if _JAVA_FOR_RE.search(q)
+        else "while문" if _JAVA_WHILE_RE.search(q)
+        else "반복문" if "반복" in q
+        else ""
+    )
+    loop_range = _JAVA_RANGE_RE.search(q)
+    if loop_word and loop_range:
+        add(f"{loop_word}으로 {loop_range['a']}부터 {loop_range['b']}까지 반복했는가")
+    elif loop_word:
+        add(f"{loop_word}을 사용해 반복했는가")
+    elif loop_range:
+        add(f"{loop_range['a']}부터 {loop_range['b']}까지의 값을 처리했는가")
+
+    # 4. 산술 연산
+    for pattern, label in _JAVA_ARITHMETIC_RULES:
+        if label == "나머지(%)" and parity:
+            continue
+        if pattern.search(q):
+            add(f"{label} 연산으로 값을 계산했는가")
+
+    # 5. 출력 (출력 요구가 있을 때만)
+    if _JAVA_PRINT_RE.search(q):
+        outputs = [
+            value
+            for value in _java_quoted_values(q)
+            if value and not _JAVA_CODE_LIKE_RE.search(value)
+            and not any(f'"{value}"' in c for c in criteria)
+        ][:_JAVA_FALLBACK_QUOTED_MAX]
+        for value in outputs:
+            add(f'"{value}"을(를) 출력했는가')
+        if not outputs:
+            add("System.out.println으로 결과를 출력했는가")
+
+    if criteria:
+        return criteria[:_JAVA_CRITERIA_MAX]
+
+    clauses = [
+        _JAVA_IMPERATIVE_ENDING_RE.sub("", clause.strip()).strip()
+        for clause in _JAVA_QUESTION_CLAUSE_SPLIT_RE.split(q)
+    ]
+    clauses = [clause for clause in clauses if clause]
+    if not clauses and q:
+        clauses = [q[:100]]
+    return [f"문제 요구사항({clause})을 구현했는가" for clause in clauses[:_JAVA_CRITERIA_MAX]]

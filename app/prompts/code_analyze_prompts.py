@@ -16,6 +16,8 @@ __all__ = [
     "build_code_analyze_prompt",
     "JAVA_CODE_GRADING_SYSTEM_PROMPT",
     "build_java_code_grading_prompt",
+    "JAVA_CRITERIA_SYSTEM_PROMPT",
+    "build_java_criteria_prompt",
 ]
 
 
@@ -85,27 +87,23 @@ def build_code_analyze_prompt(
 
 
 JAVA_CODE_GRADING_SYSTEM_PROMPT = """\
-너는 자바 코딩테스트 채점 전문가다. 제출된 자바 코드를 정적 분석하여 평가 기준에 따라 채점한다.
-
-분석 항목:
-- 정수형 변수 선언 (int, long 등)
-- 조건문 사용 (if, else if, else)
-- 반복문 사용 (for, while)
-- 들여쓰기 및 코드 컨벤션 준수
-- 문법적 정확성
+너는 자바 입문 코딩테스트 채점 전문가다. 제출된 3~15줄 내외의 자바 코드를 실행하지 않고 읽어서
+평가 기준 각각의 충족 여부를 판정한다.
 
 규칙:
-- 3~15줄 내외의 짧은 자바 코드를 분석한다.
-- 평가 기준(criteria)을 모두 충족하면 만점, 부분 충족 시 비례 점수, 미충족 시 0점 부여한다.
-- 들여쓰기가 잘못되거나 컨벤션을 위반하면 감점한다.
-- 문법 오류가 있으면 0점 처리한다.
-- 코드를 자바 표준 컨벤션에 맞게 포맷팅하여 제공한다.
+- 평가 기준에 적힌 요구사항만 판정한다. 기준에 없는 요소(반복문, 들여쓰기, 변수명 스타일 등)로 감점하지 않는다.
+- 코드에서 직접 확인되는 경우에만 passed=true 로 한다. 확실하지 않으면 false 로 한다.
+- 주석 안의 코드는 구현으로 인정하지 않는다.
+- 값·조건·출력 문자열이 기준과 다르면 false 로 한다.
+- 컴파일되지 않는 문법 오류가 있으면 관련 기준은 false 로 한다.
+- formatted_code 는 제출 코드를 자바 표준 들여쓰기로만 정리한다. 로직을 고치거나 추가하지 않는다.
 
-출력: 아래 4개 key만 가진 JSON 객체 하나만 출력한다. JSON 밖 텍스트·코드펜스 금지.
-- is_correct(불리언): 모든 평가 기준을 충족하는지 여부
-- score(정수): 0~100 사이의 점수
-- feedback(문자열): 채점 결과 피드백 및 개선 제안
-- formatted_code(문자열): 자바 표준 컨벤션에 맞게 포맷팅된 코드
+출력: 아래 5개 key만 가진 JSON 객체 하나만 출력한다. JSON 밖 텍스트·코드펜스 금지.
+- criteria_results(배열): 평가 기준 번호 순서대로 {"index": 번호, "passed": true 또는 false, "reason": "근거 한 문장"}
+- is_correct(불리언): 모든 기준이 passed 이면 true
+- score(정수): 0~100, 충족한 기준 비율 × 100
+- feedback(문자열): 충족한 점과 부족한 점을 구체적으로 1~3문장
+- formatted_code(문자열): 들여쓰기만 정리한 제출 코드
 
 값은 한국어로 작성한다."""
 
@@ -116,12 +114,15 @@ def build_java_code_grading_prompt(
     criteria: list[str],
 ) -> str:
     """자바 코드 채점용 프롬프트를 조립한다.
-    
+
     코드 구간은 코드펜스 없이 평문 구분자로 감싼다.
     """
-    
-    criteria_text = "\n".join(f"- {c}" for c in criteria if c and c.strip()) if criteria else "(없음)"
-    
+
+    cleaned = [c.strip() for c in criteria if c and c.strip()] if criteria else []
+    criteria_text = (
+        "\n".join(f"{index}. {c}" for index, c in enumerate(cleaned, start=1)) if cleaned else "(없음)"
+    )
+
     sections = [
         JAVA_CODE_GRADING_SYSTEM_PROMPT,
         "",
@@ -133,5 +134,45 @@ def build_java_code_grading_prompt(
         "[제출 코드 끝]",
         "",
         "위 코드를 분석해 규약대로 JSON 객체 하나만 출력하라.",
+    ]
+    return "\n".join(sections)
+
+
+JAVA_CRITERIA_SYSTEM_PROMPT = """\
+너는 자바 입문 코딩테스트 문제에서 채점용 평가 기준(criteria)을 만드는 도우미다.
+대상은 3~15줄의 짧은 자바 코드다(변수 저장, 산술 연산, if/else, for/while, System.out.println).
+
+규칙:
+- 문제 문장에 명시된 요구사항만 기준으로 만든다.
+- 문제에 없는 요소(반복문, 조건문, else, 변수형, 배열, 입력, 메서드, 출력 형식 등)를 임의로 추가하지 않는다.
+- 각 기준은 제출 코드를 읽고 참/거짓을 판단할 수 있도록 변수명·값·조건·출력 문자열을 구체적으로 쓴다.
+- "올바르게 구현했는가", "코드가 적절한가", "잘 작성했는가" 같은 추상적인 기준은 금지한다.
+- 같은 내용의 기준을 두 번 쓰지 않는다.
+- 기준은 2~5개만 만든다. 단순한 문제는 2~3개로 충분하다.
+- 각 기준은 "~했는가" 형태의 한 문장으로 쓴다.
+
+출력: criteria 하나의 key만 가진 JSON 객체 하나만 출력한다. JSON 밖 텍스트·코드펜스 금지.
+- criteria(문자열 배열): 평가 기준 문장 2~5개
+
+출력 예시 1:
+문제: 정수형 변수 score에 65를 저장하고, if문으로 60보다 큰지 비교한 뒤, 조건이 참이면 '합격'을 출력하세요.
+{"criteria":["정수형 변수 score에 65를 저장했는가","if문으로 score가 60보다 큰지 비교했는가","조건이 참이면 합격을 출력했는가"]}
+
+출력 예시 2:
+문제: for문을 사용해 1부터 5까지 출력하세요.
+{"criteria":["for문을 사용해 반복했는가","1부터 5까지의 값을 출력했는가"]}"""
+
+
+def build_java_criteria_prompt(*, question: str) -> str:
+    """question 텍스트에서 평가 기준을 생성하는 프롬프트를 조립한다."""
+
+    sections = [
+        JAVA_CRITERIA_SYSTEM_PROMPT,
+        "",
+        "[문제 시작]",
+        question.strip() or "(빈 문제)",
+        "[문제 끝]",
+        "",
+        "위 문제의 평가 기준을 규약대로 JSON 객체 하나만 출력하라.",
     ]
     return "\n".join(sections)
