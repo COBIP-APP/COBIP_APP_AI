@@ -216,7 +216,6 @@ class EvaluationService:
             score=score,
             correct_answer=correct_answer,
             user_answer=user_answer,
-            related_section=request.question.relatedSection,
             question_text=(request.question.question or "").strip(),
         )
         logger.info(
@@ -238,7 +237,6 @@ class EvaluationService:
     def _quiz_explanation(self, request: QuizGradeRequest, correct_answer: str) -> str:
         return request.question.explanation or self._build_explanation_fallback(
             correct_answer=correct_answer,
-            related_section=request.question.relatedSection,
             question_text=(request.question.question or "").strip(),
         )
 
@@ -1015,7 +1013,6 @@ JSON 객체 하나만 출력:
                 score=total_score,
                 correct_answer=correct_answer,
                 user_answer=user_answer,
-                related_section=question.relatedSection,
                 question_text=question_text,
             )
         logger.info(
@@ -1283,23 +1280,6 @@ JSON 객체 하나만 출력:
             settings.LLM_TIMEOUT_SECONDS,
         )
 
-    @staticmethod
-    def _section_label(related_section: str | None) -> str:
-        labels = {
-            "overview": "개요(overview)",
-            "requirements": "요구사항(requirements)",
-            "flow": "흐름(flow)",
-            "apiSpec": "API 명세(apiSpec)",
-            "codeFiles": "코드(codeFiles)",
-            "basicQuestions": "기본 문제(basicQuestions)",
-            "missions": "미션(missions)",
-            "interviewQuestions": "면접 질문(interviewQuestions)",
-            "nextRecommendations": "다음 추천(nextRecommendations)",
-        }
-        if not related_section:
-            return "기능템플릿"
-        return labels.get(related_section, related_section)
-
     def _build_quiz_feedback(
         self,
         *,
@@ -1307,7 +1287,6 @@ JSON 객체 하나만 출력:
         score: int,
         correct_answer: str,
         user_answer: str,
-        related_section: str | None,
         question_text: str,
     ) -> str:
         """화면에 그대로 노출되는 코칭형 피드백.
@@ -1316,15 +1295,10 @@ JSON 객체 하나만 출력:
         (응답 schema 변경 없이 feedback 한 필드 안에 담는다.)
         """
 
-        section_label = self._section_label(related_section)
         missing = self._missing_answer_keywords(correct_answer, user_answer)
 
         if is_correct:
-            body = self._correct_body(
-                score=score,
-                correct_answer=correct_answer,
-                section_label=section_label,
-            )
+            body = self._correct_body(score=score, correct_answer=correct_answer)
             extra = self._extra_learning_block(correct_answer)
             return self._join_blocks(body, extra)
 
@@ -1332,20 +1306,14 @@ JSON 객체 하나만 출력:
             body = self._partial_body(
                 correct_answer=correct_answer,
                 user_answer=user_answer,
-                section_label=section_label,
                 missing=missing,
             )
         else:
-            body = self._wrong_body(
-                correct_answer=correct_answer,
-                user_answer=user_answer,
-                section_label=section_label,
-            )
+            body = self._wrong_body(correct_answer=correct_answer, user_answer=user_answer)
 
         points = self._coaching_points_block(missing or extract_answer_keywords(correct_answer))
         sample = self._sample_answer_block(
             correct_answer=correct_answer,
-            section_label=section_label,
             question_text=question_text,
         )
         return self._join_blocks(body, points, sample)
@@ -1355,7 +1323,7 @@ JSON 객체 하나만 출력:
         return "\n\n".join(block for block in blocks if block).strip()
 
     @staticmethod
-    def _correct_body(*, score: int, correct_answer: str, section_label: str) -> str:
+    def _correct_body(*, score: int, correct_answer: str) -> str:
         if score >= 100:
             first = f"정답입니다. '{correct_answer}'의 핵심을 정확히 짚었습니다."
         else:
@@ -1363,10 +1331,7 @@ JSON 객체 하나만 출력:
                 f"정답으로 인정됩니다. 핵심 방향은 맞지만 '{correct_answer}'처럼 "
                 f"용어를 더 명확히 정리하면 좋습니다."
             )
-        second = (
-            f"이 답이 좋은 이유는 {section_label} 섹션에서 요구하는 핵심 개념을 "
-            f"빠뜨리지 않았기 때문입니다."
-        )
+        second = "이 답이 좋은 이유는 문제에서 요구하는 핵심 개념을 빠뜨리지 않았기 때문입니다."
         third = "이유와 동작 흐름까지 한 문장으로 덧붙이면 더 완성도 높은 답이 됩니다."
         return f"{first} {second} {third}"
 
@@ -1375,7 +1340,6 @@ JSON 객체 하나만 출력:
         *,
         correct_answer: str,
         user_answer: str,
-        section_label: str,
         missing: set[str],
     ) -> str:
         included = extract_answer_keywords(user_answer) & extract_answer_keywords(correct_answer)
@@ -1388,13 +1352,11 @@ JSON 객체 하나만 출력:
             f"다만 정답 '{correct_answer}'에서 기대하는 '{missing_text}' 개념이 빠져 "
             f"설명이 충분하지 않습니다."
         )
-        third = (
-            f"다음 답변에서는 빠진 개념을 {section_label} 섹션 기준으로 함께 적어 보세요."
-        )
+        third = "다음 답변에서는 빠진 핵심 개념에 대한 설명을 함께 적어 보세요."
         return f"{first} {second} {third}"
 
     @staticmethod
-    def _wrong_body(*, correct_answer: str, user_answer: str, section_label: str) -> str:
+    def _wrong_body(*, correct_answer: str, user_answer: str) -> str:
         if not user_answer.strip():
             first = "오답입니다. 답변이 비어 있어 채점할 내용이 없습니다."
         else:
@@ -1403,8 +1365,7 @@ JSON 객체 하나만 출력:
                 f"핵심 개념이 빠져 있습니다."
             )
         second = (
-            f"이 문제의 핵심은 '{correct_answer}'이며, {section_label} 섹션에서 다루는 "
-            f"개념과 직접 연결됩니다."
+            f"이 문제의 핵심은 '{correct_answer}'이며, 관련 개념을 다시 확인해보세요."
         )
         third = (
             f"다음 답변에서는 '{correct_answer}'의 의미와 그것이 필요한 이유를 "
@@ -1430,13 +1391,12 @@ JSON 객체 하나만 출력:
     def _sample_answer_block(
         *,
         correct_answer: str,
-        section_label: str,
         question_text: str,
     ) -> str:
         topic = question_text.rstrip("?").strip() if question_text else "이 문제"
         sample = (
             f"\"{topic}에 대해서는 '{correct_answer}'을(를) 사용합니다. "
-            f"이는 {section_label} 섹션에서 요구하는 처리이기 때문입니다. "
+            f"이는 문제에서 요구하는 핵심 처리이기 때문입니다. "
             f"따라서 해당 개념을 적용해 안전하고 일관된 동작을 보장합니다.\""
         )
         return "[개선 답안 예시]\n" + sample
@@ -1460,16 +1420,13 @@ JSON 객체 하나만 출력:
     def _build_explanation_fallback(
         *,
         correct_answer: str,
-        related_section: str | None,
         question_text: str,
     ) -> str:
-        section_label = EvaluationService._section_label(related_section)
         question_hint = f"문제 '{question_text}'의 " if question_text else ""
         return (
             f"{question_hint}정답은 '{correct_answer}'입니다. "
-            f"{section_label} 섹션에서 해당 개념이 왜 필요한지, "
-            f"어떤 입력·처리·결과 흐름과 연결되는지 다시 읽어 보세요. "
-            f"기능템플릿에 없는 새 개념은 추가하지 말고, 템플릿 근거로 이해를 정리하세요."
+            f"해당 개념이 왜 필요한지, 어떤 입력·처리·결과 흐름과 연결되는지 "
+            f"관련 개념과 설명을 다시 확인해보세요."
         )
 
     def _grade_answer(
