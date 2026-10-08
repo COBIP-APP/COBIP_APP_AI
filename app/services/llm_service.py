@@ -52,6 +52,7 @@ class LLMService:
         *,
         timeout_seconds: int | float | None = None,
         max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> str:
         """단일 prompt 로 텍스트 응답을 받는다.
 
@@ -77,6 +78,7 @@ class LLMService:
             messages,
             timeout_seconds=timeout_seconds,
             max_tokens=max_tokens,
+            temperature=temperature,
         )
         return self._extract_content(result)
 
@@ -108,6 +110,7 @@ class LLMService:
         *,
         timeout_seconds: int | float | None = None,
         max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> dict:
         """OpenAI-호환 /chat/completions 엔드포인트를 호출한다.
 
@@ -121,10 +124,16 @@ class LLMService:
         url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/chat/completions"
         model_name = settings.OLLAMA_MODEL
         token_limit = max_tokens if max_tokens is not None else settings.LLM_MAX_TOKENS
+        effective_temperature = (
+            settings.LLM_TEMPERATURE
+            if temperature is None
+            else temperature
+        )
+
         payload = {
             "model": model_name,
             "messages": messages,
-            "temperature": settings.LLM_TEMPERATURE,
+            "temperature": effective_temperature,
             "max_tokens": token_limit,
         }
 
