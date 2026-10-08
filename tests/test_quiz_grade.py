@@ -90,10 +90,16 @@ class TestQuizGradeService:
         assert "오답" in result.feedback
         assert "평문 저장" in result.feedback
 
-    def test_feedback_includes_section_context(self) -> None:
-        req = QuizGradeRequest(**_quiz_payload())
-        result = EvaluationService().grade_quiz(req)
-        assert "requirements" in result.feedback
+    @pytest.mark.parametrize("user_answer", ["bcrypt hash", "controller 사용", "그냥 저장한다"])
+    def test_feedback_has_no_feature_template_wording(self, user_answer: str) -> None:
+        payload = _quiz_payload(userAnswer=user_answer)
+        payload["question"] = dict(payload["question"])
+        payload["question"]["explanation"] = ""
+        result = EvaluationService().grade_quiz(QuizGradeRequest(**payload))
+        for text in (result.feedback, result.explanation):
+            assert "기능템플릿" not in text
+            assert "섹션" not in text
+        assert result.relatedSection == "requirements"
 
     def test_explanation_fallback_uses_correct_answer_and_section(self) -> None:
         payload = _quiz_payload()
@@ -102,7 +108,7 @@ class TestQuizGradeService:
         req = QuizGradeRequest(**payload)
         result = EvaluationService().grade_quiz(req)
         assert "BCrypt 해시" in result.explanation
-        assert "requirements" in result.explanation
+        assert "관련 개념과 설명을 다시 확인해보세요" in result.explanation
 
     def test_fe_related_api_specs_shape_no_422(self) -> None:
         QuizGradeRequest(**_quiz_payload())
@@ -164,7 +170,7 @@ class TestQuizGradeService:
         req = QuizGradeRequest(**payload)
         result = EvaluationService().grade_quiz(req)
         assert result.correctAnswer in result.explanation
-        assert "requirements" in result.explanation
+        assert "기능템플릿" not in result.explanation
 
 
 class TestQuizGradeApi:
