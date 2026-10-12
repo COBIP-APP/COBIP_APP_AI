@@ -127,7 +127,12 @@ class RetrieverService:
                 )
             )
 
-        logger.info("retriever retrieve complete count=%s", len(refs))
+        logger.info(
+            "retriever retrieve complete count=%s embedding_ms=%s qdrant_ms=%s",
+            len(refs),
+            embedding_ms,
+            qdrant_search_ms,
+        )
         return RetrieverTimingResult(
             references=refs,
             embeddingMs=embedding_ms,
