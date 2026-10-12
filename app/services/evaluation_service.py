@@ -1628,12 +1628,14 @@ JSON 객체 하나만 출력:
         criteria: list[str],
         request: JavaCodeGradingRequest,
     ) -> JavaCodeGradingResponse:
-        """LLM 채점 결과를 서버 규칙으로 보수적으로 재계산한다.
+        """LLM 채점 결과를 서버 코드 근거(evidence)와 결합해 재계산한다.
 
-        - criteria_results 가 있으면 기준별 passed 로 점수를 서버가 계산한다.
-        - 코드에서 근거(출력 문자열·변수명·if/for 등)가 확인되지 않는 기준은 passed 여도 미충족 처리한다.
-        - criteria_results 가 없으면 LLM score 를 근거 상한으로 제한한다.
-        - is_correct 는 score == 100 과 항상 일치시킨다.
+        기준별 판정 우선순위:
+        - evidence True  → LLM 판정과 무관하게 충족
+        - evidence False → LLM 판정과 무관하게 미충족
+        - evidence None  → (서버가 판단할 근거가 없을 때만) LLM passed 사용
+        criteria_results 가 없으면 evidence None 기준에만 LLM score 비율을 적용한다.
+        is_correct 는 score == 100 과 항상 일치시킨다.
         """
         total = len(criteria)
         evidence = [
@@ -1645,24 +1647,28 @@ JSON 객체 하나만 출력:
         if results is None:
             if "score" not in parsed:
                 raise ValueError("채점 응답에 criteria_results / score 가 없습니다")
-            evidence_cap = round(100 * sum(ev is not False for ev in evidence) / total)
-            score = min(self._validate_score(parsed.get("score")), evidence_cap)
-            if _coerce_java_bool(parsed.get("is_correct")) is not True:
-                # LLM 이 '전부 충족'이라고 하지 않았다면 최소 1개 기준은 미충족으로 본다.
-                score = min(score, round(100 * (total - 1) / total))
-            met: list[str] = []
+            met = [c for c, ev in zip(criteria, evidence, strict=True) if ev is True]
             unmet = [
-                (criterion, _JAVA_NO_EVIDENCE_REASON)
-                for criterion, ev in zip(criteria, evidence, strict=True)
+                (c, _JAVA_NO_EVIDENCE_REASON)
+                for c, ev in zip(criteria, evidence, strict=True)
                 if ev is False
             ]
+            undecided = sum(ev is None for ev in evidence)
+            if undecided:
+                llm_ratio = self._validate_score(parsed.get("score")) / 100
+                score = round(100 * (len(met) + undecided * llm_ratio) / total)
+                if _coerce_java_bool(parsed.get("is_correct")) is not True:
+                    # LLM 이 '전부 충족'이라고 하지 않았다면 최소 1개 기준은 미충족으로 본다.
+                    score = min(score, round(100 * (total - 1) / total))
+            else:
+                score = round(100 * len(met) / total)
         else:
             met, unmet = [], []
             for criterion, (passed, reason), ev in zip(criteria, results, evidence, strict=True):
-                if passed and ev is False:
-                    unmet.append((criterion, _JAVA_NO_EVIDENCE_REASON))
-                elif passed:
+                if ev is True or (ev is None and passed):
                     met.append(criterion)
+                elif ev is False:
+                    unmet.append((criterion, _JAVA_NO_EVIDENCE_REASON))
                 else:
                     unmet.append((criterion, reason))
             score = round(100 * len(met) / total)
@@ -2135,11 +2141,10 @@ def _java_criterion_evidence(criterion: str, code: str, question: str | None) ->
     code_clean, literals = _java_code_views(code)
 
     checks: list[bool] = []
-    for value in outputs:
-        if not q or value in q:
-            # '합격' 기준이 "불합격" 리터럴로 통과하지 않도록 단어 경계를 둔다.
-            pattern = re.compile(rf"(?<![가-힣A-Za-z0-9]){re.escape(value)}(?![가-힣A-Za-z0-9])")
-            checks.append(any(pattern.search(literal) for literal in literals))
+    required_outputs = [value for value in outputs if not q or value in q]
+    for value in required_outputs:
+        # '합격' 기준이 "불합격" 리터럴로 통과하지 않도록 단어 경계를 둔다.
+        checks.append(any(_java_output_pattern(value).search(literal) for literal in literals))
     if q:
         question_numbers = set(_JAVA_NUMBER_RE.findall(q))
         checks += [_java_number_in_code(n, code_clean) for n in numbers if n in question_numbers]
@@ -2147,7 +2152,162 @@ def _java_criterion_evidence(criterion: str, code: str, question: str | None) ->
         if not q or _java_has_identifier(ident, q):
             checks.append(_java_has_identifier(ident, code_clean))
     checks += [bool(code_re.search(code_clean)) for code_re in concepts]
+
+    # 구조 검사: 단순 토큰 존재가 아니라 비교 방향·if 블록 내부 출력까지 확인한다.
+    mentions_if = _JAVA_IF_MENTION_RE.search(bare) is not None
+    targets = _java_comparison_targets(bare, q)
+    conditional_print = (
+        _JAVA_CONDITIONAL_PRINT_RE.search(bare) is not None
+        and _JAVA_PRINT_MENTION_RE.search(bare) is not None
+    )
+    if targets or conditional_print:
+        plain, masked = _java_aligned_views(code)
+        if_blocks = _java_if_blocks(plain, masked)
+        if targets:
+            # if 를 언급한 기준이면 if 조건식 안의 비교만 인정한다.
+            scopes = [cond for cond, _, _ in if_blocks] if mentions_if else [masked]
+            checks.append(
+                all(any(_java_comparison_in(target, scope) for scope in scopes) for target in targets)
+            )
+        if conditional_print:
+            checks.append(_java_prints_inside_if(if_blocks, required_outputs))
     return all(checks) if checks else None
+
+
+_JAVA_CMP_OPS = r"(>=|<=|==|!=|>|<)"
+_JAVA_CRITERION_OP_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<op>{_JAVA_CMP_OPS[1:-1]})\s*"
+    r"(?P<num>\d+(?:\.\d+)?)(?![A-Za-z0-9_.])"
+)
+_JAVA_CODE_CMP_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.])(?:(?P<lvar>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<lop>{_JAVA_CMP_OPS[1:-1]})\s*"
+    r"(?P<lnum>-?\d+(?:\.\d+)?)"
+    rf"|(?P<rnum>-?\d+(?:\.\d+)?)\s*(?P<rop>{_JAVA_CMP_OPS[1:-1]})\s*"
+    r"(?P<rvar>[A-Za-z_][A-Za-z0-9_]*))(?![A-Za-z0-9_.])"
+)
+_JAVA_FLIPPED_OP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "==": "==", "!=": "!="}
+_JAVA_IF_MENTION_RE = re.compile(r"\bif\b|if문|조건문", re.I)
+_JAVA_PRINT_MENTION_RE = re.compile(r"출력|print", re.I)
+# "조건이 참이면 ~ 출력", "60보다 크면 ~ 출력" 처럼 조건부 출력을 요구하는 기준
+_JAVA_CONDITIONAL_PRINT_RE = re.compile(
+    r"참이면|참일\s*때|참인\s*경우|만족하면|만족할\s*때|만족하는\s*경우|조건[이가]?\s*(?:참|true|만족)"
+    r"|(?:크|작|같|많|적|이상|이하|초과|미만)(?:으)?면",
+    re.I,
+)
+_JAVA_CHAR_LITERAL_RE = re.compile(r"'((?:[^'\\\n]|\\.)*)'")
+_JAVA_PRINT_CALL_RE = re.compile(r"System\s*\.\s*out\s*\.\s*print(?:ln|f)?\s*\(")
+
+
+def _java_output_pattern(value: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![가-힣A-Za-z0-9]){re.escape(value)}(?![가-힣A-Za-z0-9])")
+
+
+def _java_aligned_views(code: str) -> tuple[str, str]:
+    """위치가 정렬된 (주석만 공백 처리한 코드, 주석·문자/문자열 리터럴 내용까지 가린 코드)."""
+    plain = _JAVA_CODE_COMMENT_RE.sub(
+        lambda m: m.group(1) or re.sub(r"[^\n]", " ", m.group(0)), code
+    )
+    masked = _JAVA_STRING_LITERAL_RE.sub(lambda m: '"' + "_" * len(m.group(1)) + '"', plain)
+    masked = _JAVA_CHAR_LITERAL_RE.sub(lambda m: "'" + "_" * len(m.group(1)) + "'", masked)
+    return plain, masked
+
+
+def _java_matching_close(text: str, open_index: int, open_char: str, close_char: str) -> int | None:
+    depth = 0
+    for index in range(open_index, len(text)):
+        if text[index] == open_char:
+            depth += 1
+        elif text[index] == close_char:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _java_if_blocks(plain: str, masked: str) -> list[tuple[str, str, str]]:
+    """if 문 목록 → (조건식[masked], 본문[plain], 본문[masked]). 본문은 {...} 또는 단일 문장."""
+    blocks: list[tuple[str, str, str]] = []
+    for match in re.finditer(r"\bif\s*\(", masked):
+        cond_close = _java_matching_close(masked, match.end() - 1, "(", ")")
+        if cond_close is None:
+            continue
+        start = cond_close + 1
+        while start < len(masked) and masked[start].isspace():
+            start += 1
+        if start >= len(masked):
+            continue
+        if masked[start] == "{":
+            end = _java_matching_close(masked, start, "{", "}")
+            if end is None:
+                continue
+            body_range = (start + 1, end)
+        else:
+            end = masked.find(";", start)
+            if end == -1:
+                continue
+            body_range = (start, end + 1)
+        blocks.append(
+            (masked[match.end() : cond_close], plain[slice(*body_range)], masked[slice(*body_range)])
+        )
+    return blocks
+
+
+def _java_prints_inside_if(if_blocks: list[tuple[str, str, str]], outputs: list[str]) -> bool:
+    """if 본문 안의 System.out.print* 호출이 요구 출력 문자열(없으면 아무 출력)을 출력하는지."""
+    for _, body_plain, body_masked in if_blocks:
+        for call in _JAVA_PRINT_CALL_RE.finditer(body_masked):
+            close = _java_matching_close(body_masked, call.end() - 1, "(", ")")
+            if close is None:
+                continue
+            literals = _JAVA_STRING_LITERAL_RE.findall(body_plain[call.end() : close])
+            if not outputs or all(
+                any(_java_output_pattern(value).search(literal) for literal in literals)
+                for value in outputs
+            ):
+                return True
+    return False
+
+
+def _java_comparison_targets(bare: str, question: str) -> list[tuple[str | None, str, str]]:
+    """기준 문장에서 요구하는 비교 (변수 or None, 연산자, 숫자). 문제에 없는 숫자는 강제하지 않는다."""
+    targets: list[tuple[str | None, str, str]] = []
+    for match in _JAVA_CRITERION_OP_RE.finditer(bare):
+        if match["var"].lower() not in _JAVA_STOP_IDENTIFIERS:
+            targets.append((match["var"], match["op"], match["num"]))
+    for match in _JAVA_COMPARE_RE.finditer(bare):
+        preceding = _java_identifiers(bare[: match.start()])
+        targets.append(
+            (preceding[-1] if preceding else None, _java_relation(match["rel"]), match["num"])
+        )
+    if question:
+        question_numbers = set(_JAVA_NUMBER_RE.findall(question))
+        targets = [t for t in targets if t[2] in question_numbers]
+    return targets
+
+
+def _java_canonical_comparison(op: str, number: str) -> tuple[str, float]:
+    """정수 비교는 'x > 60' ≡ 'x >= 61', 'x < 6' ≡ 'x <= 5' 로 정규화한다."""
+    if re.fullmatch(r"-?\d+", number):
+        value = int(number)
+        if op == ">":
+            return ">=", value + 1
+        if op == "<":
+            return "<=", value - 1
+        return op, value
+    return op, float(number)
+
+
+def _java_comparison_in(target: tuple[str | None, str, str], scope: str) -> bool:
+    var, op, number = target
+    expected = _java_canonical_comparison(op, number)
+    for match in _JAVA_CODE_CMP_RE.finditer(scope):
+        if match["lvar"]:
+            code_var, code_op, code_num = match["lvar"], match["lop"], match["lnum"]
+        else:
+            code_var, code_op, code_num = match["rvar"], _JAVA_FLIPPED_OP[match["rop"]], match["rnum"]
+        if (var is None or code_var == var) and _java_canonical_comparison(code_op, code_num) == expected:
+            return True
+    return False
 
 
 def _normalize_java_criterion(item: object) -> str:
