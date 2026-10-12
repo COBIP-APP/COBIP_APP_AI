@@ -404,12 +404,14 @@ class TestGradingSafety:
         assert "근거를 찾지 못했습니다" in result.feedback
 
     def test_server_recomputes_score_from_criteria_results(self) -> None:
-        request = JavaCodeGradingRequest(question=QUESTION, code=CODE)
+        """서버가 근거를 판단할 수 없는(evidence None) 기준에서만 LLM passed 가 점수에 반영된다."""
+        criteria = ["정수형 변수 score에 65를 저장했는가", "문제 의도에 맞게 구현했는가", "조건이 참이면 합격을 출력했는가"]
+        request = JavaCodeGradingRequest(question=QUESTION, code=CODE, criteria=criteria)
         raw = _grade_json([True, False, True], score=100, is_correct=True)
-        result, _ = _grade(request, CRITERIA_JSON, raw)
+        result, _ = _grade(request, raw)
         assert (result.score, result.is_correct) == (67, False)
         assert "평가 기준 3개 중 2개를 충족했습니다." in result.feedback
-        assert "- if문으로 score가 60보다 큰지 비교했는가 (기준 2 근거)" in result.feedback
+        assert "- 문제 의도에 맞게 구현했는가 (기준 2 근거)" in result.feedback
 
     def test_missing_criteria_results_caps_llm_score(self) -> None:
         request = JavaCodeGradingRequest(question=QUESTION, code=CODE_NO_IF)
@@ -418,12 +420,21 @@ class TestGradingSafety:
         assert result.score == 33
         assert result.is_correct is False
 
-    def test_llm_is_correct_false_never_returns_100(self) -> None:
-        request = JavaCodeGradingRequest(question=QUESTION, code=CODE)
+    def test_llm_is_correct_false_never_returns_100_when_undecided(self) -> None:
+        """evidence None 기준이 있을 때 LLM 이 '전부 충족'이 아니라고 하면 100점이 되지 않는다."""
+        criteria = [CRITERIA_3[0], "문제 의도에 맞게 구현했는가"]
+        request = JavaCodeGradingRequest(question=QUESTION, code=CODE, criteria=criteria)
         raw = json.dumps({"is_correct": False, "score": 100, "feedback": "f", "formatted_code": "x"})
-        result, _ = _grade(request, CRITERIA_JSON, raw)
+        result, _ = _grade(request, raw)
         assert result.score < 100
         assert result.is_correct is False
+
+    def test_missing_criteria_results_all_decided_by_evidence(self) -> None:
+        """모든 기준이 evidence 로 판정되면 criteria_results 가 없어도 LLM score/is_correct 는 무시된다."""
+        request = JavaCodeGradingRequest(question=QUESTION, code=CODE)
+        raw = json.dumps({"is_correct": False, "score": 10, "feedback": "f", "formatted_code": "x"})
+        result, _ = _grade(request, CRITERIA_JSON, raw)
+        assert (result.score, result.is_correct) == (100, True)
 
     @pytest.mark.parametrize("llm_score", [250, -30, "abc"])
     def test_score_clamped(self, llm_score: object) -> None:
@@ -462,6 +473,125 @@ class TestGradingSafety:
         request = JavaCodeGradingRequest(code=CODE_WRONG, criteria=["if문으로 조건을 검사했는가"])
         result, _ = _grade(request, RuntimeError("down"))
         assert result.score == 0
+
+
+# ---------------------------------------------------------------------------
+# server evidence 우선 + 구조 검사 (비교 방향 / if 블록 내부 출력)
+# ---------------------------------------------------------------------------
+def _main(body: str) -> str:
+    return (
+        "public class Main {\n    public static void main(String[] args) {\n"
+        f"        int score = 65;\n{body}\n    }}\n}}"
+    )
+
+
+CASE_A_CODE = _main('        if (score > 60) {\n            System.out.println("합격");\n        }')
+CASE_B_CODE = _main('        System.out.println("합격");')
+CASE_C_CODE = _main('        if (score < 60) {\n            System.out.println("합격");\n        }')
+CASE_D_CODE = _main('        if (score >= 61) {\n            System.out.println("합격");\n        }')
+_IF_CRITERION, _PRINT_CRITERION = CRITERIA_3[1], CRITERIA_3[2]
+
+
+def _met(feedback: str) -> str:
+    return feedback.split("[충족한 요구사항]", 1)[1].split("[부족한 요구사항]", 1)[0] if "[충족한 요구사항]" in feedback else ""
+
+
+def _unmet(feedback: str) -> str:
+    return feedback.split("[부족한 요구사항]", 1)[1] if "[부족한 요구사항]" in feedback else ""
+
+
+class TestEvidencePriority:
+    def test_case_a_full_answer_overrides_llm_false(self) -> None:
+        """Case A: LLM 이 if 기준을 false 로 줘도 서버 근거가 True 면 100점."""
+        request = JavaCodeGradingRequest(question=QUESTION, code=CASE_A_CODE)
+        result, _ = _grade(request, CRITERIA_JSON, _grade_json([True, False, True], score=67, is_correct=False))
+        assert (result.score, result.is_correct) == (100, True)
+        assert _IF_CRITERION in _met(result.feedback)
+
+    def test_case_a_all_llm_false_still_100(self) -> None:
+        request = JavaCodeGradingRequest(question=QUESTION, code=CASE_A_CODE)
+        result, _ = _grade(request, CRITERIA_JSON, _grade_json([False, False, False]))
+        assert (result.score, result.is_correct) == (100, True)
+
+    def test_case_b_print_only_not_full_score(self) -> None:
+        """Case B: if 없이 출력만 있으면 조건부 출력·if 기준 모두 미충족 (LLM 이 true 라고 해도)."""
+        request = JavaCodeGradingRequest(question=QUESTION, code=CASE_B_CODE)
+        result, _ = _grade(request, CRITERIA_JSON, GRADE_ALL_PASS)
+        assert result.score != 100
+        assert result.is_correct is False
+        unmet = _unmet(result.feedback)
+        assert _PRINT_CRITERION in unmet
+        assert _IF_CRITERION in unmet
+        assert result.score == 33
+
+    def test_case_c_wrong_comparison_direction(self) -> None:
+        """Case C: score < 60 은 'score가 60보다 큰지' 기준을 충족하지 않는다."""
+        request = JavaCodeGradingRequest(question=QUESTION, code=CASE_C_CODE)
+        result, _ = _grade(request, CRITERIA_JSON, GRADE_ALL_PASS)
+        assert result.score != 100
+        assert result.is_correct is False
+        assert _IF_CRITERION in _unmet(result.feedback)
+        assert _PRINT_CRITERION in _met(result.feedback)
+
+    def test_case_d_equivalent_comparison(self) -> None:
+        """Case D: score >= 61 은 score > 60 과 동치로 인정한다."""
+        request = JavaCodeGradingRequest(question=QUESTION, code=CASE_D_CODE)
+        result, _ = _grade(request, CRITERIA_JSON, _grade_json([True, False, True]))
+        assert (result.score, result.is_correct) == (100, True)
+
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [
+            (CASE_A_CODE, [True, True, True]),
+            (CASE_B_CODE, [True, False, False]),
+            (CASE_C_CODE, [True, False, True]),
+            (CASE_D_CODE, [True, True, True]),
+        ],
+    )
+    def test_case_evidence_per_criterion(self, code: str, expected: list[bool]) -> None:
+        assert [evaluation_service_module._java_criterion_evidence(c, code, QUESTION) for c in CRITERIA_3] == expected
+
+    def test_rule_fallback_uses_same_structural_evidence(self) -> None:
+        for code, score in ((CASE_A_CODE, 100), (CASE_B_CODE, 33), (CASE_C_CODE, 67), (CASE_D_CODE, 100)):
+            result, _ = _grade(JavaCodeGradingRequest(question=QUESTION, code=code), CRITERIA_JSON, RuntimeError("down"))
+            assert result.score == score
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            ('        if (60 < score) System.out.println("합격");', True),        # 좌우 반전 + 중괄호 없는 단일 문장
+            ('        if (score > 60 && score <= 100) {\n            System.out.println("합격");\n        }', True),
+            ('        if (score >= 60) {\n            System.out.println("합격");\n        }', False),  # 60 포함 → 동치 아님
+            ('        if (score > 59) {\n            System.out.println("합격");\n        }', False),
+            ('        // if (score > 60) {\n        System.out.println("합격");', False),  # 주석 안의 if
+        ],
+    )
+    def test_comparison_direction_and_equivalence(self, body: str, expected: bool) -> None:
+        assert evaluation_service_module._java_criterion_evidence(_IF_CRITERION, _main(body), QUESTION) is expected
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            ('        if (score > 60) System.out.print("합격");', True),
+            ('        if (score > 60) {\n            System.out.println("불합격");\n        }', False),
+            ('        if (score > 60) {\n        }\n        System.out.println("합격");', False),  # if 블록 밖 출력
+            ('        if (score > 60) {\n            String s = "합격";\n        }', False),          # 출력 아님
+            ('        if (score > 60) {\n            if (score > 0) {\n                System.out.println("합격");\n            }\n        }', True),
+        ],
+    )
+    def test_conditional_print_requires_print_inside_if(self, body: str, expected: bool) -> None:
+        assert evaluation_service_module._java_criterion_evidence(_PRINT_CRITERION, _main(body), QUESTION) is expected
+
+    def test_unconditional_print_criterion_unaffected(self) -> None:
+        """조건부가 아닌 출력 기준은 if 없이 출력해도 충족 (구조 검사는 조건부 기준에만 적용)."""
+        assert evaluation_service_module._java_criterion_evidence('"합격"을(를) 출력했는가', CASE_B_CODE, QUESTION) is True
+
+    def test_undecided_criterion_uses_llm_passed(self) -> None:
+        criteria = ["문제 의도에 맞게 구현했는가"]
+        for passed, score in ((True, 100), (False, 0)):
+            result, _ = _grade(JavaCodeGradingRequest(question=QUESTION, code=CASE_A_CODE, criteria=criteria),
+                               _grade_json([passed]))
+            assert result.score == score
 
 
 # ---------------------------------------------------------------------------
