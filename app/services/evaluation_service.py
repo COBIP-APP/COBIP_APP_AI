@@ -689,6 +689,10 @@ JSON 객체 하나만 출력:
                 type(exc).__name__,
             )
             similarity = 1.0
+            # 임베딩 실패 시의 1.0 은 '근거 없음'이므로 서버 cause 보정 근거로 쓰지 않는다.
+            embedding_ok = False
+        else:
+            embedding_ok = True
 
         # 관련성이 너무 낮으면 LLM까지 보내지 않는다.
         if similarity < 0.68:
@@ -808,7 +812,11 @@ JSON 객체 하나만 출력:
             "처리해야", "고쳐", "교체", "범위를 확인",
         )
 
-        has_fix_evidence = any(
+        # 모범답안에 명시된 수정 코드 조각이 학생 답안에 그대로(숫자·인덱스·연산자까지) 있는지
+        fix_snippet = _cef_fix_code_evidence(correct_answer, user_answer, question_text)
+        contradiction_cue = _cef_contradiction_cue(user_answer)
+
+        has_fix_evidence = fix_snippet is not None or any(
             term in user_answer
             for term in fix_evidence_terms
         )
@@ -824,11 +832,47 @@ JSON 객체 하나만 출력:
         if has_contradiction and cause_correct and fix_correct:
             fix_correct = False
 
+        # 1.5B LLM false-negative 보정 (보수적):
+        # 모순이 없고, 모범답안에 명시된 수정 코드가 학생 답안에 정확히 있을 때만 fix=true.
+        fix_corrected_by_server = False
+        if (
+            not fix_correct
+            and fix_snippet is not None
+            and not has_contradiction
+            and not contradiction_cue
+        ):
+            logger.info(
+                "code_error_find fix corrected by code evidence snippet=%r similarity=%.4f",
+                fix_snippet,
+                similarity,
+            )
+            fix_correct = True
+            fix_corrected_by_server = True
+
+        # cause 는 더 보수적으로: 수정 코드 근거(서버 확인) + 모순 없음 + 실제 계산된 높은 유사도.
+        # 오류 대상 코드 언급만으로는 보정하지 않는다(원인을 틀리게 설명해도 대상 코드는 쓸 수 있음).
+        if (
+            not cause_correct
+            and fix_correct
+            and fix_snippet is not None
+            and not has_contradiction
+            and not contradiction_cue
+            and embedding_ok
+            and similarity >= _CEF_CAUSE_CORRECTION_MIN_SIMILARITY
+        ):
+            logger.info(
+                "code_error_find cause corrected by code evidence snippet=%r similarity=%.4f",
+                fix_snippet,
+                similarity,
+            )
+            cause_correct = True
+
         # BGE-M3가 모범답안과 매우 높은 의미 유사도를 보이고,
         # 수정 방법도 맞으며 모순이 없으면 LLM의 과도한 cause=false를 보정한다.
         if (
             not cause_correct
             and fix_correct
+            and not fix_corrected_by_server  # 서버가 보정한 fix 는 위의 더 엄격한 규칙만 적용
             and not has_contradiction
             and similarity >= 0.90
         ):
@@ -1850,6 +1894,74 @@ def _coerce_int(value: object) -> int | None:
         return round(float(value))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# CODE_ERROR_FIND 전용: 수정 코드 근거 (1.5B LLM false-negative 보수적 보정용)
+# ---------------------------------------------------------------------------
+# cause 보정은 서버 수정 코드 근거 + 실제 계산된 높은 유사도가 함께 있을 때만 한다.
+# (실측: 원인+수정 정답 0.86대 / 원인 오답+정답 수정코드 0.76~0.79)
+_CEF_CAUSE_CORRECTION_MIN_SIMILARITY = 0.85
+_CEF_MIN_SNIPPET_CHARS = 4
+# 한글이 아닌 연속 구간 중 코드 문자로만 이뤄진 부분 (예: int x = 10;  Integer.parseInt("10")  nums[2])
+_CEF_CODE_RUN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.\[\]()\"'=+\-*/%<>!&|,; ]*")
+# 수정안으로 볼 만한 코드 특징 (대입·호출·인덱스·비교·멤버 접근)
+_CEF_CODE_FEATURE_RE = re.compile(r"[=(\[<>]|\.\w")
+_CEF_NEGATED_AFTER_RE = re.compile(
+    r"^\s*(?:으로|로|를|을|은|는|이|가)?\s*(?:바꾸|수정하|변경하|고치|쓰|사용하|하)?\w{0,3}\s*"
+    r"(?:면\s*)?(?:안\s*(?:됩|돼|된|되)|않|말|마세|마라|마십|금지|필요\s*(?:가\s*)?없)"
+)
+# 오류가 없다는 취지의 직접 모순 표현 (일반 표현만; 특정 문제 문장 하드코딩 금지)
+_CEF_CONTRADICTION_CUE_RE = re.compile(
+    r"그대로\s*(?:두|둬|사용|써)|(?:문제|오류|에러)(?:가|는)?\s*없|"
+    r"(?:수정할|수정|고칠|바꿀|변경할)\s*필요(?:가|는)?\s*없|정상(?:적으로)?\s*(?:동작|실행|컴파일)"
+)
+
+
+def _cef_normalize_code(snippet: str) -> str:
+    return re.sub(r"\s+", "", snippet).replace("'", '"').rstrip(";,.")
+
+
+def _cef_code_runs(text: str) -> list[tuple[str, int, int]]:
+    """텍스트 안의 코드 형태 구간 (원문, 시작, 끝). 코드 특징이 없는 단어(int, Java 등)는 제외."""
+    runs: list[tuple[str, int, int]] = []
+    for match in _CEF_CODE_RUN_RE.finditer(text or ""):
+        raw = match.group().rstrip(" ,.")
+        if len(_cef_normalize_code(raw)) >= _CEF_MIN_SNIPPET_CHARS and _CEF_CODE_FEATURE_RE.search(raw):
+            runs.append((raw, match.start(), match.start() + len(raw)))
+    return runs
+
+
+def _cef_fix_code_evidence(correct_answer: str, user_answer: str, question_text: str) -> str | None:
+    """모범답안에 명시된 수정 코드 조각이 학생 답안에 정확히 있으면 그 조각을 반환한다.
+
+    - 숫자·인덱스·변수명·연산자가 하나라도 다르면 인정하지 않는다 (공백·따옴표 종류·끝 세미콜론만 무시).
+    - 문제 지문에 있는 오류 코드 자체(예: int x = "10")는 수정안으로 보지 않는다.
+    - 바로 뒤에 "~하면 안 됩니다"처럼 부정되는 조각은 인정하지 않는다.
+    - 모범답안에 없는 새로운 수정법은 서버가 판단하지 않는다(None → 기존 LLM 판정 유지).
+    """
+    question_code = {_cef_normalize_code(raw) for raw, _, _ in _cef_code_runs(question_text)}
+    question_compact = _cef_normalize_code(question_text or "")
+    candidates = [
+        _cef_normalize_code(raw)
+        for raw, _, _ in _cef_code_runs(correct_answer)
+        if _cef_normalize_code(raw) not in question_code
+        and _cef_normalize_code(raw) not in question_compact
+    ]
+    if not candidates:
+        return None
+    for raw, _, end in _cef_code_runs(user_answer):
+        normalized = _cef_normalize_code(raw)
+        if _CEF_NEGATED_AFTER_RE.search(user_answer[end : end + 20]):
+            continue
+        for candidate in candidates:
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(candidate)}(?![A-Za-z0-9_])", normalized):
+                return candidate
+    return None
+
+
+def _cef_contradiction_cue(user_answer: str) -> bool:
+    return _CEF_CONTRADICTION_CUE_RE.search(user_answer or "") is not None
 
 
 # ---------------------------------------------------------------------------
